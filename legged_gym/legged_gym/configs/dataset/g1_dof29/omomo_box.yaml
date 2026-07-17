@@ -1,0 +1,38 @@
+defaults:
+  - /robot@_global_.robot: g1_dof29
+  - badminton_hit
+  - _self_
+
+task_id: omomo_box
+
+dataset:
+  folder: /home/aozhou/shixiongbo/GMR/outputs/omomo_smplx
+  joint_mapping: /home/aozhou/shixiongbo/GMR/outputs/omomo_smplx/g1_dof29_joint_id.txt
+  # Filled at runtime from event_trigger_frames in the motion package.  Do
+  # not add hand-written times here: semantic events are dataset-specific.
+  keyframe_times: []
+  keyframe_pos_index: []
+  special_scale_index: []
+  # SMPL-X: pelvis, spine3, head, L/R shoulder, elbow, wrist, hip, knee, ankle.
+  dense_human_joint_indices: [0, 9, 15, 16, 18, 20, 17, 19, 21, 1, 4, 7, 2, 5, 8]
+  dense_human_robot_body_names: ['pelvis', 'torso_link', 'head_link', 'left_shoulder_roll_link', 'left_elbow_link', 'left_wrist_yaw_link', 'right_shoulder_roll_link', 'right_elbow_link', 'right_wrist_yaw_link', 'left_hip_pitch_link', 'left_knee_link', 'left_ankle_roll_link', 'right_hip_pitch_link', 'right_knee_link', 'right_ankle_roll_link']
+  dense_human_foot_pair_indices: [11, 14]
+  dense_human_angle_joint_indices: [1, 2, 4, 5, 7, 8, 9, 16, 17, 18, 19]
+  dense_human_robot_dof_groups: [['left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint'], ['right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint'], ['left_knee_joint'], ['right_knee_joint'], ['left_ankle_pitch_joint', 'left_ankle_roll_joint'], ['right_ankle_pitch_joint', 'right_ankle_roll_joint'], ['waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint'], ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint'], ['right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint'], ['left_elbow_joint'], ['right_elbow_joint']]
+  # SMPL-X axis-angle components are [roll, pitch, yaw]. Robot group order is explicit.
+  dense_human_angle_component_maps: [[1, 0, 2], [1, 0, 2], [0], [0], [1, 0], [1, 0], [2, 0, 1], [1, 0, 2], [1, 0, 2], [0], [0]]
+  dense_human_angle_signs: [[1, 1, 1], [1, 1, 1], [1], [1], [1, 1], [1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1], [1], [1]]
+
+rewards:
+  scales:
+    dense_tracking_human_local_position: 1.0
+    dense_tracking_human_joint_angle: 0.5
+    dense_tracking_human_root_velocity: 1.0
+    dense_tracking_human_heading: 1.0
+    dense_tracking_human_feet_velocity: 1.0
+  reward_tracking_sigma:
+    human_local_pos: 0.08
+    human_joint_angle: 0.25
+    human_root_velocity: 0.25
+    human_heading: 0.25
+    human_feet_velocity: 0.25

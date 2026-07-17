@@ -1,0 +1,47 @@
+# GMR's Unitree G1 model: 12 leg + 3 waist + 14 arm DoFs.
+defaults:
+  - g1_dof27
+  - _self_
+
+name: g1_dof29
+
+env:
+  num_actions: 30  # 29 actuators plus AdaMimic's inferred-time action
+  num_dofs: 29
+  num_one_step_observations: 100
+  num_observations: 500
+  num_observations_high: 100
+  num_privileged_obs: 136
+  num_privileged_obs_high: 136
+
+init_state:
+  all_default_joint_angles:
+    waist_roll_joint: 0.0
+    waist_pitch_joint: 0.0
+  actutaed_default_joint_angles:
+    waist_roll_joint: 0.0
+    waist_pitch_joint: 0.0
+
+control:
+  stiffness:
+    waist_roll: 40.1792
+    waist_pitch: 40.1792
+  damping:
+    waist_roll: 2.5579
+    waist_pitch: 2.5579
+  action_scale: [1.0951, 0.7013, 1.0951, 0.7013, 0.8772, 0.8772,
+                 1.0951, 0.7013, 1.0951, 0.7013, 0.8772, 0.8772,
+                 1.0951, 0.8772, 0.8772,
+                 0.8772, 0.8772, 0.8772, 0.8772, 0.8772, 0.1490, 0.1490,
+                 0.8772, 0.8772, 0.8772, 0.8772, 0.8772, 0.1490, 0.1490]
+  curriculum_joints: ['waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_shoulder_pitch_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint', 'right_shoulder_pitch_joint', 'right_elbow_joint', 'right_wrist_roll_joint', 'right_wrist_pitch_joint', 'right_wrist_yaw_joint']
+
+asset:
+  file: /home/aozhou/shixiongbo/GMR/assets/unitree_g1/g1_custom_collision_29dof.urdf
+  name: g1_dof29
+  lidar_name: torso_link
+  keyframe_body_names: ['pelvis', 'torso_link', 'head_link', 'left_shoulder_pitch_link', 'left_shoulder_roll_link', 'left_elbow_link', 'left_wrist_yaw_link', 'right_shoulder_pitch_link', 'right_shoulder_roll_link', 'right_elbow_link', 'right_wrist_yaw_link', 'left_hip_pitch_link', 'left_knee_link', 'left_ankle_roll_link', 'right_hip_pitch_link', 'right_knee_link', 'right_ankle_roll_link']
+  feet_contact_body_names: ['left_ankle_roll_link', 'right_ankle_roll_link']
+  feet_keyframe_body_names: ['left_ankle_roll_link', 'right_ankle_roll_link']
+  upper_keyframe_names: ['pelvis', 'torso_link', 'head_link', 'left_shoulder_pitch_link', 'left_shoulder_roll_link', 'left_elbow_link', 'left_wrist_yaw_link', 'right_shoulder_pitch_link', 'right_shoulder_roll_link', 'right_elbow_link', 'right_wrist_yaw_link']
+  lower_keyframe_names: ['left_hip_pitch_link', 'left_knee_link', 'left_ankle_roll_link', 'right_hip_pitch_link', 'right_knee_link', 'right_ankle_roll_link']

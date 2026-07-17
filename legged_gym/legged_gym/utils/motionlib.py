@@ -129,8 +129,24 @@ class MotionLib:
         self.body_rpy = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
         self.body_lin_vel = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
         self.body_ang_vel = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
+        # Optional mask-aware supervision.  Legacy AdaMimic datasets have no
+        # mask and therefore retain their original "all reference frames are
+        # valid" behaviour.
+        human_joint_count = datasets[0].get("human_joint_position", torch.empty(0, 0, 3)).shape[1]
+        self.reference_valid = torch.ones(self.total_length, dtype=torch.bool, device=device)
+        self.event_id = torch.full((self.total_length,), -1, dtype=torch.long, device=device)
+        self.human_joint_pos = torch.zeros(self.total_length, human_joint_count, 3, dtype=torch.float, device=device)
+        self.human_joint_pos_local = torch.zeros_like(self.human_joint_pos)
+        self.human_joint_vel_local = torch.zeros_like(self.human_joint_pos)
+        self.human_joint_axis_angle = torch.zeros(self.total_length, 22, 3, dtype=torch.float, device=device)
+        self.human_root_vel_local = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
+        self.human_heading_xy = torch.zeros(self.total_length, 2, dtype=torch.float, device=device)
+        self.object_pos = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
 
         self.body_names = [name for name in body_names]
+        self.event_names = datasets[0].get("event_names", [])
+        event_frames = datasets[0].get("event_trigger_frames", torch.empty(0, dtype=torch.long))
+        self.event_times = torch.as_tensor(event_frames, dtype=torch.float, device=device) / self.fps
         print(body_names)
 
         compute_velocity = lambda x: (x[1:] - x[:-1]) * self.fps
@@ -141,6 +157,20 @@ class MotionLib:
             self.base_rpy[start:end] = data["base_pose"][:-1].clone().detach()
             self.base_lin_vel[start:end] = compute_velocity(data["base_position"]).clone().detach()
             self.base_ang_vel[start:end] = compute_velocity(data["base_pose"]).clone().detach()
+
+            if "reference_valid_mask" in data:
+                self.reference_valid[start:end] = data["reference_valid_mask"][:-1].clone().detach().to(device=device, dtype=torch.bool)
+                self.event_id[start:end] = data["event_id"][:-1].clone().detach().to(device=device, dtype=torch.long)
+            if human_joint_count and "human_joint_position" in data:
+                self.human_joint_pos[start:end] = data["human_joint_position"][:-1].clone().detach()
+                self.human_joint_pos_local[start:end] = data["human_joint_position_local"][:-1].clone().detach()
+                self.human_joint_vel_local[start:end] = data["human_joint_velocity_local"][:-1].clone().detach()
+            if "human_joint_axis_angle" in data:
+                self.human_joint_axis_angle[start:end] = data["human_joint_axis_angle"][:-1].clone().detach()
+                self.human_root_vel_local[start:end] = data["human_root_velocity_local"][:-1].clone().detach()
+                self.human_heading_xy[start:end] = data["human_heading_xy"][:-1].clone().detach()
+            if "object_position" in data:
+                self.object_pos[start:end] = data["object_position"][:-1].clone().detach()
             
             dof_pos = data["joint_position"][:-1].clone().detach()
             dof_vel = compute_velocity(data["joint_position"]).clone().detach()
@@ -149,12 +179,15 @@ class MotionLib:
                     self.dof_pos[start:end, j] = dof_pos[:, mapping[name]]
                     self.dof_vel[start:end, j] = dof_vel[:, mapping[name]]
 
+            source_body_names = data.get("link_body_list", body_names)
             for k, name in enumerate(body_names):
-                # import ipdb; ipdb.set_trace()
-                self.body_pos[start:end, k] = data["link_position"][:-1, k,].clone().detach()
-                self.body_rpy[start:end, k] = data["link_orientation"][:-1, k].clone().detach()
-                self.body_lin_vel[start:end, k] = data["link_velocity"][:-1, k].clone().detach()
-                self.body_ang_vel[start:end, k] =data["link_angular_velocity"][:-1, k].clone().detach()
+                # New sparse-GMR packages retain all FK bodies and identify
+                # them by name.  Legacy datasets keep the original order.
+                source_index = source_body_names.index(name) if name in source_body_names else k
+                self.body_pos[start:end, k] = data["link_position"][:-1, source_index].clone().detach()
+                self.body_rpy[start:end, k] = data["link_orientation"][:-1, source_index].clone().detach()
+                self.body_lin_vel[start:end, k] = data["link_velocity"][:-1, source_index].clone().detach()
+                self.body_ang_vel[start:end, k] =data["link_angular_velocity"][:-1, source_index].clone().detach()
             
             self.body_pos[start:end, :, 0:2] -= self.base_pos[start:start+1, None, 0:2]
             self.base_pos[start:end, 0:2] -= self.base_pos[start:start+1, 0:2].clone() 
@@ -246,6 +279,16 @@ class MotionLib:
             body_quat=blend_motion_for_quat(self.body_rpy),
             body_lin_vel=blend_motion(self.body_lin_vel), 
             body_ang_vel=blend_motion(self.body_ang_vel),
+
+            reference_valid=self.reference_valid[motion_start_ids + floors],
+            event_id=self.event_id[motion_start_ids + floors],
+            human_joint_pos=blend_motion(self.human_joint_pos),
+            human_joint_pos_local=blend_motion(self.human_joint_pos_local),
+            human_joint_vel_local=blend_motion(self.human_joint_vel_local),
+            human_joint_axis_angle=blend_motion(self.human_joint_axis_angle),
+            human_root_vel_local=blend_motion(self.human_root_vel_local),
+            human_heading_xy=blend_motion(self.human_heading_xy),
+            object_pos=blend_motion(self.object_pos),
 
             norm_time = norm_time
         )

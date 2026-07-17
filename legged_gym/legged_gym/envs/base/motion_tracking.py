@@ -429,7 +429,7 @@ class LeggedRobot(BaseTask):
                 self.is_offset_stage += (self.cur_keyframe_stage >= keyframe_pos_index).int()
 
         self.onging_offset_stage = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        keyframe_prev_time = [self.keyframe_times[self.keyframe_pos_index[i] - 1] for i in range(len(self.keyframe_pos_index))]
+        keyframe_prev_time = [self.keyframe_times[max(self.keyframe_pos_index[i] - 1, 0)] for i in range(len(self.keyframe_pos_index))]
         keyframe_time = [self.keyframe_times[self.keyframe_pos_index[i]] for i in range(len(self.keyframe_pos_index))]
         for i in range(len(self.keyframe_pos_index)):
             if self.cfg.dataset.only_single_keyframe:
@@ -1718,6 +1718,15 @@ class LeggedRobot(BaseTask):
             self.motions = MotionLibAMP(dataset, mapping, self.dof_names, self.keyframe_names, self.cfg.dataset.frame_rate, self.cfg.dataset.min_time, device=self.device, \
                                     amp_obs_type=self.amp_obs_type, window_length=self.cfg.amp.num_steps, ratio_random_range=[0.95, 1.05], height_offset=self.cfg.dataset.height_offset)
 
+        # Semantic trigger times are produced by the final VLM+SMPL-X
+        # pipeline, not copied from a hand-written dataset YAML.
+        if not self.amp and self.motions.event_times.numel():
+            self.keyframe_times = self.motions.event_times
+            self.keyframe_times_with_zero = torch.cat([
+                torch.zeros(1, device=self.device), self.keyframe_times
+            ])
+            self.keyframe_pos_index = list(range(len(self.keyframe_times)))
+
         self.motion_ids = self.motions.sample_motions(self.num_envs)
         self.motion_time = self.motions.sample_time(self.motion_ids, uniform=False)
         self.motion_dict = self.motions.get_motion_states(self.motion_ids, self.motion_time)
@@ -1747,6 +1756,17 @@ class LeggedRobot(BaseTask):
                 self.lower_keyframe_indices.append(self.motions.body_names.index(name))
         self.upper_keyframe_indices = torch.tensor(self.upper_keyframe_indices, dtype=torch.long, device=self.device, requires_grad=False)
         self.lower_keyframe_indices = torch.tensor(self.lower_keyframe_indices, dtype=torch.long, device=self.device, requires_grad=False)
+        # Optional SMPL-X -> robot common-state map.  It is deliberately
+        # configuration-driven: the robot links are not assumed to share an
+        # index/order with SMPL-X or with GMR FK bodies.
+        dense_robot_names = getattr(self.cfg.dataset, "dense_human_robot_body_names", [])
+        dense_human_joints = getattr(self.cfg.dataset, "dense_human_joint_indices", [])
+        if len(dense_robot_names) != len(dense_human_joints):
+            raise ValueError("dense_human_robot_body_names and dense_human_joint_indices must have equal length")
+        self.dense_human_robot_indices = torch.tensor(
+            [self.keyframe_names.index(name) for name in dense_robot_names], dtype=torch.long, device=self.device
+        )
+        self.dense_human_joint_indices = torch.tensor(dense_human_joints, dtype=torch.long, device=self.device)
 
         self.average_episode_length = 0. # num_compute_average_epl last termination episode length
         self.last_episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -1875,7 +1895,7 @@ class LeggedRobot(BaseTask):
                 2.3 create actor with these properties and add them to the env
              3. Store indices of different bodies of the robot
         """
-        asset_path = LEGGED_GYM_ROOT_DIR + self.cfg.asset.file
+        asset_path = self.cfg.asset.file if os.path.isabs(self.cfg.asset.file) else LEGGED_GYM_ROOT_DIR + self.cfg.asset.file
         asset_root = os.path.dirname(asset_path)
         asset_file = os.path.basename(asset_path)
 
@@ -2058,16 +2078,20 @@ class LeggedRobot(BaseTask):
         self.upper_body_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.cfg.control.upper_body_link)
 
 
+        explicit_keyframes = getattr(self.cfg.asset, "keyframe_body_names", None)
         self.feet_contact_names, self.feet_keyframe_names = [], []
-        for key, value in self.cfg.asset.feet_contact_binding.items():
-            self.feet_contact_names += [s for s in body_names if (value in s) and (not self.cfg.asset.keyframe_name in s)]
-            self.feet_keyframe_names += [s for s in body_names if (key in s) and (self.cfg.asset.keyframe_name in s)]
-        
-        assert len(self.feet_contact_names) == len(self.feet_keyframe_names)
+        if explicit_keyframes is None:
+            for key, value in self.cfg.asset.feet_contact_binding.items():
+                self.feet_contact_names += [s for s in body_names if (value in s) and (not self.cfg.asset.keyframe_name in s)]
+                self.feet_keyframe_names += [s for s in body_names if (key in s) and (self.cfg.asset.keyframe_name in s)]
+            assert len(self.feet_contact_names) == len(self.feet_keyframe_names)
+        else:
+            self.feet_contact_names = self.cfg.asset.feet_contact_body_names
+            self.feet_keyframe_names = self.cfg.asset.feet_keyframe_body_names
         get_body_index = lambda n: self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], n)
         
         self.feet_contact_indices = torch.tensor([get_body_index(n) for n in self.feet_contact_names], dtype=torch.long, device=self.device)
-        self.keyframe_names = [s for s in body_names if self.cfg.asset.keyframe_name in s]
+        self.keyframe_names = explicit_keyframes if explicit_keyframes is not None else [s for s in body_names if self.cfg.asset.keyframe_name in s]
         self.keyframe_indices = torch.zeros(len(self.keyframe_names), dtype=torch.long, device=self.device)
         for i, name in enumerate(self.keyframe_names):
             self.keyframe_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name)
@@ -2521,6 +2545,17 @@ class LeggedRobot(BaseTask):
         
         self.motion_dof_pos = self.motion_dict["dof_pos"][:]
         self.motion_dof_vel = self.motion_dict["dof_vel"][:]
+        # These are present for the keyframe-preference dataset and default
+        # to valid/zero in MotionLib for legacy full-reference datasets.
+        self.motion_reference_valid = self.motion_dict["reference_valid"][:]
+        self.motion_event_id = self.motion_dict["event_id"][:]
+        self.motion_human_joint_pos = self.motion_dict["human_joint_pos"][:]
+        self.motion_human_joint_pos_local = self.motion_dict["human_joint_pos_local"][:]
+        self.motion_human_joint_vel_local = self.motion_dict["human_joint_vel_local"][:]
+        self.motion_human_joint_axis_angle = self.motion_dict["human_joint_axis_angle"][:]
+        self.motion_human_root_vel_local = self.motion_dict["human_root_vel_local"][:]
+        self.motion_human_heading_xy = self.motion_dict["human_heading_xy"][:]
+        self.motion_object_pos = self.motion_dict["object_pos"][:]
 
 
     #------------ reward functions----------------
@@ -2674,7 +2709,7 @@ class LeggedRobot(BaseTask):
 
         if self.sparse_global:
             if self.cfg.dataset.keyframe_pos_direction is None:
-                return r_body_pos * self.is_stage_transition
+                return r_body_pos * self.is_stage_transition * self.motion_reference_valid
             else:
                 special_scales = torch.tensor(self.cfg.dataset.special_scales, device=self.device, dtype=torch.float)
                 return r_body_pos * self.is_stage_transition * special_scales[self.is_offset_stage]
@@ -2703,10 +2738,81 @@ class LeggedRobot(BaseTask):
         r_body_pos_lower = torch.exp(-diff_body_pos_dist_lower / self.cfg.rewards.reward_tracking_sigma.teleop_lower_body_pos)
         r_body_pos = r_body_pos_lower * self.cfg.rewards.teleop_body_pos_lowerbody_weight + r_body_pos_upper * self.cfg.rewards.teleop_body_pos_upperbody_weight
     
+        # Sparse GMR states only exist inside semantic key windows.  Never
+        # let held-pose placeholders become a dense imitation objective.
+        if hasattr(self, "motion_reference_valid"):
+            r_body_pos = r_body_pos * self.motion_reference_valid
         if self.sparse_local:
             return r_body_pos * self.is_stage_transition 
         else:
             return r_body_pos #* self._infer_dt() / self.dt
+
+    def _reward_tracking_human_local_position(self):
+        """Dense non-key reward in a root-local, semantic joint space.
+
+        GMR references are intentionally unavailable outside key windows; the
+        SMPL-X joint target is therefore the only imitation target there.
+        """
+        if self.dense_human_robot_indices.numel() == 0:
+            return torch.zeros(self.num_envs, device=self.device)
+        robot_local = self.body_pos[:, self.dense_human_robot_indices] - self.base_pos[:, None]
+        robot_local = quat_rotate_inverse(
+            self.base_quat[:, None, :].repeat(1, robot_local.shape[1], 1), robot_local
+        )
+        human_local = self.motion_human_joint_pos_local[:, self.dense_human_joint_indices]
+        squared_error = torch.square(robot_local - human_local).mean(dim=(1, 2))
+        reward = torch.exp(-squared_error / self.cfg.rewards.reward_tracking_sigma.human_local_pos)
+        return reward * (~self.motion_reference_valid)
+
+    def _reward_tracking_human_joint_angle(self):
+        """Non-key joint-articulation reward in a signed semantic axis space."""
+        groups = getattr(self.cfg.dataset, "dense_human_robot_dof_groups", [])
+        human_ids = getattr(self.cfg.dataset, "dense_human_angle_joint_indices", [])
+        component_maps = getattr(self.cfg.dataset, "dense_human_angle_component_maps", [])
+        signs = getattr(self.cfg.dataset, "dense_human_angle_signs", [])
+        if not (len(groups) == len(human_ids) == len(component_maps) == len(signs)):
+            raise ValueError("Human joint-angle mapping fields must have equal length")
+        errors = []
+        for names, human_id, components, axis_signs in zip(groups, human_ids, component_maps, signs):
+            robot_ids = [self.dof_names.index(name) for name in names]
+            if len(robot_ids) != len(components) or len(robot_ids) != len(axis_signs):
+                raise ValueError(f"Invalid axis map for robot group {names}")
+            human_angle = self.motion_human_joint_axis_angle[:, human_id, components]
+            human_angle = human_angle * torch.tensor(axis_signs, device=self.device)
+            errors.append(torch.square(self.dof_pos[:, robot_ids] - human_angle).mean(dim=1))
+        if not errors:
+            return torch.zeros(self.num_envs, device=self.device)
+        error = torch.stack(errors, dim=1).mean(dim=1)
+        reward = torch.exp(-error / self.cfg.rewards.reward_tracking_sigma.human_joint_angle)
+        return reward * (~self.motion_reference_valid)
+
+    def _reward_tracking_human_root_velocity(self):
+        robot_velocity = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        error = torch.square(robot_velocity - self.motion_human_root_vel_local).mean(dim=1)
+        reward = torch.exp(-error / self.cfg.rewards.reward_tracking_sigma.human_root_velocity)
+        return reward * (~self.motion_reference_valid)
+
+    def _reward_tracking_human_heading(self):
+        forward = torch.zeros(self.num_envs, 3, device=self.device)
+        forward[:, 0] = 1.0
+        robot_heading = quat_apply(self.base_quat, forward)[:, :2]
+        error = torch.square(robot_heading - self.motion_human_heading_xy).mean(dim=1)
+        reward = torch.exp(-error / self.cfg.rewards.reward_tracking_sigma.human_heading)
+        return reward * (~self.motion_reference_valid)
+
+    def _reward_tracking_human_feet_velocity(self):
+        pair_indices = getattr(self.cfg.dataset, "dense_human_foot_pair_indices", [])
+        if not pair_indices:
+            return torch.zeros(self.num_envs, device=self.device)
+        robot_body_indices = self.dense_human_robot_indices[pair_indices]
+        robot_velocity = self.body_lin_vel[:, robot_body_indices]
+        robot_velocity = quat_rotate_inverse(
+            self.base_quat[:, None, :].repeat(1, len(pair_indices), 1), robot_velocity - self.root_states[:, None, 7:10]
+        )
+        human_velocity = self.motion_human_joint_vel_local[:, self.dense_human_joint_indices[pair_indices]]
+        error = torch.square(robot_velocity - human_velocity).mean(dim=(1, 2))
+        reward = torch.exp(-error / self.cfg.rewards.reward_tracking_sigma.human_feet_velocity)
+        return reward * (~self.motion_reference_valid)
 
     def _reward_tracking_body_rot(self):
         self.dif_global_body_rot = quat_to_angle_axis(quat_mul(self.motion_body_quat, quat_conjugate(self.body_quat)))[0]
