@@ -25,11 +25,16 @@ dataset:
 
 rewards:
   scales:
+    # Stage-1 non-key imitation deliberately has a single, smooth target.
+    # The sparse GMR targets remain responsible for the semantic events.  The
+    # velocity/heading terms caused a competing short-horizon objective and
+    # PPO collapsed after roughly 4k iterations; direct SMPL-X axis-angle
+    # components are not calibrated enough to be used as a reward yet.
     dense_tracking_human_local_position: 1.0
-    dense_tracking_human_joint_angle: 0.5
-    dense_tracking_human_root_velocity: 1.0
-    dense_tracking_human_heading: 1.0
-    dense_tracking_human_feet_velocity: 1.0
+    dense_tracking_human_joint_angle: 0.0
+    dense_tracking_human_root_velocity: 0.0
+    dense_tracking_human_heading: 0.0
+    dense_tracking_human_feet_velocity: 0.0
   reward_tracking_sigma:
     human_local_pos: 0.08
     human_joint_angle: 0.25
