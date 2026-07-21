@@ -130,3 +130,12 @@ dataset:
   keyframe_pos_direction: null
 
 checkpoint_path: ${checkpoint_path}
+
+# Legacy datasets retain learned phase and their mixed sparse-GMR/human reward
+# formulation unless an explicit dataset overlay requests full robot reference.
+reference_mode:
+  type: sparse_gmr_human_dense
+
+phase_control:
+  mode: learned
+  fixed_dt_scale: 1.0

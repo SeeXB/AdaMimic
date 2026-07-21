@@ -36,12 +36,20 @@ import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
+from pathlib import Path
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.1")
 def main(cfg):
-    cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
-    cfg.run_dir = HydraConfig.get().runtime.output_dir
+    output_dir = Path(HydraConfig.get().runtime.output_dir)
+    resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
+    # Hydra's own config snapshot may retain interpolation syntax.  Persist a
+    # fully resolved copy alongside every run so the code/config comparison is
+    # reproducible without relying on W&B metadata.
+    OmegaConf.save(config=OmegaConf.create(resolved_cfg), f=output_dir / "resolved_config.yaml")
+    print(f"[Config] wrote resolved config to {output_dir / 'resolved_config.yaml'}")
+    cfg = AttrDict(resolved_cfg)
+    cfg.run_dir = str(output_dir)
     env, env_cfg = task_registry.make_env_hydra(cfgs=cfg)
 
     ppo_runner, train_cfg = task_registry.make_alg_runner_hydra(env=env, env_cfg=env_cfg, cfgs=cfg)

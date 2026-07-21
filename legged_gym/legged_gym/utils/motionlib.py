@@ -42,16 +42,18 @@ def load_imitation_dataset(folder, mapping="joint_id.txt", suffix=".pt"):
         mapping = os.path.join(current_file_dir, mapping)
         mapping = os.path.normpath(mapping)
 
-    filenames = [name for name in os.listdir(folder) if name[-len(suffix):] == suffix]
+    filenames = sorted(name for name in os.listdir(folder) if name[-len(suffix):] == suffix)
     datatset = {}
     for filename in tqdm(filenames):
         try:
             data = torch.load(os.path.join(folder, filename))
             datatset[filename[:-len(suffix)]] = data
-        except:
-            print(f"{filename} load failed!!!")
+        except (OSError, RuntimeError, pickle.UnpicklingError) as error:
+            print(f"{filename} load failed: {error}")
             continue
     dataset_list = list(datatset.values())
+    if not dataset_list:
+        raise RuntimeError(f"No readable '{suffix}' motion packages in {folder}")
     random.shuffle(dataset_list)
     
     lines = open(mapping).readlines()
@@ -120,6 +122,8 @@ class MotionLib:
         self.start_ids = torch.nn.functional.pad(self.end_ids, (1, -1), "constant", 0)
         
         self.base_rpy = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
+        self.base_quat = torch.zeros(self.total_length, 4, dtype=torch.float, device=device)
+        self.base_quat[:, 3] = 1.0
         self.base_pos = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
         self.base_lin_vel = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
         self.base_ang_vel = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
@@ -127,6 +131,8 @@ class MotionLib:
         self.dof_vel = torch.zeros(self.total_length, len(dof_names), dtype=torch.float, device=device)
         self.body_pos = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
         self.body_rpy = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
+        self.body_quat = torch.zeros(self.total_length, len(body_names), 4, dtype=torch.float, device=device)
+        self.body_quat[..., 3] = 1.0
         self.body_lin_vel = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
         self.body_ang_vel = torch.zeros(self.total_length, len(body_names), 3, dtype=torch.float, device=device)
         # Optional mask-aware supervision.  Legacy AdaMimic datasets have no
@@ -149,14 +155,14 @@ class MotionLib:
         self.event_times = torch.as_tensor(event_frames, dtype=torch.float, device=device) / self.fps
         print(body_names)
 
-        compute_velocity = lambda x: (x[1:] - x[:-1]) * self.fps
         print(f"Moving motion dataset to {self.device}...")
         for i, data in enumerate(tqdm(datasets)):
             start, end = self.start_ids[i], self.end_ids[i]    
             self.base_pos[start:end] = data["base_position"][:-1].clone().detach()
             self.base_rpy[start:end] = data["base_pose"][:-1].clone().detach()
-            self.base_lin_vel[start:end] = compute_velocity(data["base_position"]).clone().detach()
-            self.base_ang_vel[start:end] = compute_velocity(data["base_pose"]).clone().detach()
+            self.base_quat[start:end] = data.get("base_quaternion", euler_xyz_to_quat(data["base_pose"]))[:-1].clone().detach()
+            self.base_lin_vel[start:end] = data.get("base_velocity", (data["base_position"][1:] - data["base_position"][:-1]) * self.fps)[:-1 if "base_velocity" in data else None].clone().detach()
+            self.base_ang_vel[start:end] = data.get("base_angular_velocity", (data["base_pose"][1:] - data["base_pose"][:-1]) * self.fps)[:-1 if "base_angular_velocity" in data else None].clone().detach()
 
             if "reference_valid_mask" in data:
                 self.reference_valid[start:end] = data["reference_valid_mask"][:-1].clone().detach().to(device=device, dtype=torch.bool)
@@ -173,7 +179,10 @@ class MotionLib:
                 self.object_pos[start:end] = data["object_position"][:-1].clone().detach()
             
             dof_pos = data["joint_position"][:-1].clone().detach()
-            dof_vel = compute_velocity(data["joint_position"]).clone().detach()
+            dof_vel = data.get("joint_velocity", (data["joint_position"][1:] - data["joint_position"][:-1]) * self.fps)
+            if "joint_velocity" in data:
+                dof_vel = dof_vel[:-1]
+            dof_vel = dof_vel.clone().detach()
             for j, name in enumerate(dof_names):
                 if name in mapping.keys():
                     self.dof_pos[start:end, j] = dof_pos[:, mapping[name]]
@@ -186,6 +195,7 @@ class MotionLib:
                 source_index = source_body_names.index(name) if name in source_body_names else k
                 self.body_pos[start:end, k] = data["link_position"][:-1, source_index].clone().detach()
                 self.body_rpy[start:end, k] = data["link_orientation"][:-1, source_index].clone().detach()
+                self.body_quat[start:end, k] = data.get("link_quaternion", euler_xyz_to_quat(data["link_orientation"]))[:-1, source_index].clone().detach()
                 self.body_lin_vel[start:end, k] = data["link_velocity"][:-1, source_index].clone().detach()
                 self.body_ang_vel[start:end, k] =data["link_angular_velocity"][:-1, source_index].clone().detach()
             
@@ -259,16 +269,14 @@ class MotionLib:
         blend_motion = lambda x: self.calc_blend(x,
             motion_start_ids + floors, motion_start_ids + floors + 1, 
             floors + 1 - timesteps, timesteps - floors)
-        blend_motion_for_quat = lambda x:euler_xyz_to_quat(blend_motion(x))
-        blend_motion_for_quat_2dim = lambda x: euler_xyz_to_quat(blend_motion(x))
-
-        quat = torch.tensor([0, 0, 1, 1], dtype=torch.float, device=self.device).unsqueeze(0)
+        def blend_quaternion(quat):
+            return torch.nn.functional.normalize(blend_motion(quat), dim=-1)
 
         norm_time = timesteps[:, None] / self.length[motion_ids][:, None]
         # import ipdb; ipdb.set_trace()
         return dict(
             base_pos=blend_motion(self.base_pos),
-            base_quat=blend_motion_for_quat_2dim(self.base_rpy),
+            base_quat=blend_quaternion(self.base_quat),
             base_lin_vel=blend_motion(self.base_lin_vel),
             base_ang_vel=blend_motion(self.base_ang_vel),
             
@@ -276,7 +284,7 @@ class MotionLib:
             dof_vel=blend_motion(self.dof_vel),
             
             body_pos=blend_motion(self.body_pos), 
-            body_quat=blend_motion_for_quat(self.body_rpy),
+            body_quat=blend_quaternion(self.body_quat),
             body_lin_vel=blend_motion(self.body_lin_vel), 
             body_ang_vel=blend_motion(self.body_ang_vel),
 

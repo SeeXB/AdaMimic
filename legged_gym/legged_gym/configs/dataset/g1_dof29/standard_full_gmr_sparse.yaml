@@ -1,0 +1,34 @@
+defaults:
+  - /robot@_global_.robot: g1_dof29
+  - badminton_hit
+  - _self_
+
+# Kept identical to focused_full_gmr_sparse.yaml except dataset reference path.
+task_id: omomo_box_full_gmr_sparse
+
+reference_mode:
+  type: full_gmr_sparse
+
+phase_control:
+  mode: fixed_reference
+  fixed_dt_scale: 1.0
+
+dataset:
+  folder: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard
+  joint_mapping: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard/joint_id.txt
+  keyframe_times: []
+  keyframe_pos_index: []
+  special_scale_index: []
+
+rewards:
+  scales:
+    # Disable only the old non-key SMPL-X objectives.  All inherited sparse
+    # keyframe scales, sigmas, stage logic and regularizers are unchanged.
+    dense_tracking_human_local_position: 0.0
+    dense_tracking_human_joint_angle: 0.0
+    dense_tracking_human_root_velocity: 0.0
+    dense_tracking_human_heading: 0.0
+    dense_tracking_human_feet_velocity: 0.0
+    dense_tracking_dof_pos: 0.75
+    dense_tracking_body_position_local: 0.75
+    dense_tracking_body_rot_local: 0.5

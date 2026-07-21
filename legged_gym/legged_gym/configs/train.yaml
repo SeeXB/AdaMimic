@@ -137,6 +137,8 @@ env:
   reward_penalty: ${algorithm.reward_penalty}
   termination: ${dataset.termination}
   dataset: ${dataset.dataset}
+  reference_mode: ${dataset.reference_mode}
+  phase_control: ${dataset.phase_control}
 
   termination_curriculum: ${algorithm.termination_curriculum}
   algorithm: ${algorithm.algorithm}

@@ -1,0 +1,11 @@
+defaults:
+  - /algorithm/adamimic/stage1@_here_
+  - _self_
+
+# Keep Stage-1's 30-D action interface (29 joints + time action). In
+# `phase_control.mode=fixed_reference`, the environment ignores the final
+# action and advances reference time by a fixed dt instead.
+algorithm:
+  # Full-reference datasets currently have no special_scale_index.  Do not
+  # silently enable the legacy x50 path without an event-to-stage mapping.
+  special_scale: false

@@ -141,6 +141,10 @@ class LeggedRobot(BaseTask):
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self.infer_keyframe_time = self.cfg.algorithm.infer_keyframe_time
+        self.reference_mode_type = str(getattr(getattr(self.cfg, "reference_mode", {}), "type", "sparse_gmr_human_dense"))
+        self.phase_control_mode = str(getattr(getattr(self.cfg, "phase_control", {}), "mode", "learned"))
+        self.fixed_dt_scale = float(getattr(getattr(self.cfg, "phase_control", {}), "fixed_dt_scale", 1.0))
+        self._validate_reference_mode_config()
         self._init_buffers()
         self._prepare_reward_function()
         self.init_done = True
@@ -158,6 +162,29 @@ class LeggedRobot(BaseTask):
         self.reverse_term_curriculum_flag = False
         self.reverse_term_curriculum_count = True
         self.rsi = self.cfg.algorithm.rsi
+
+    def _validate_reference_mode_config(self):
+        """Validate that a full robot reference cannot silently use human rewards."""
+        allowed = {"sparse_gmr_human_dense", "standard_full_gmr", "focused_full_gmr", "full_gmr_sparse"}
+        if self.reference_mode_type not in allowed:
+            raise ValueError(f"Unknown reference_mode.type={self.reference_mode_type!r}; expected one of {sorted(allowed)}")
+        if self.phase_control_mode not in {"learned", "fixed_reference"}:
+            raise ValueError("phase_control.mode must be 'learned' or 'fixed_reference'")
+        if self.fixed_dt_scale <= 0.0:
+            raise ValueError("phase_control.fixed_dt_scale must be positive")
+        if self.reference_mode_type in {"standard_full_gmr", "focused_full_gmr", "full_gmr_sparse"}:
+            human_rewards = (
+                "dense_tracking_human_local_position",
+                "dense_tracking_human_joint_angle",
+                "dense_tracking_human_root_velocity",
+                "dense_tracking_human_heading",
+                "dense_tracking_human_feet_velocity",
+            )
+            enabled = [name for name in human_rewards if abs(float(self.cfg.rewards.scales.get(name, 0.0))) > 0.0]
+            if enabled:
+                raise ValueError(
+                    f"{self.reference_mode_type} requires all human-space rewards disabled; nonzero: {enabled}"
+                )
 
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
@@ -397,15 +424,18 @@ class LeggedRobot(BaseTask):
                 self.motion_dict["body_pos"][env_ids, :, :2] += accumulated_offset[env_ids, None, :]
 
     def _infer_dt(self):
+        if self.phase_control_mode == "fixed_reference":
+            # motion_time is measured in seconds; dt is one policy/control step.
+            return torch.full_like(self.motion_time, self.dt * self.fixed_dt_scale)
         return self.actions[:, -1].clone() * self.dt_scale
 
     def check_keyframe_stage(self):
         self.is_stage_transition = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         for i in range(self.keyframe_times.shape[0]):
-            if self.infer_keyframe_time:
-                is_transition = torch.logical_and((self.motion_time - self._infer_dt()) < self.keyframe_times[i], self.motion_time >= self.keyframe_times[i])
-            else:
-                is_transition = torch.logical_and((self.motion_time - self.dt * self.dt_scale) < self.keyframe_times[i], self.motion_time >= self.keyframe_times[i])
+            is_transition = torch.logical_and(
+                (self.motion_time - self._infer_dt()) < self.keyframe_times[i],
+                self.motion_time >= self.keyframe_times[i],
+            )
             self.cur_keyframe_stage += is_transition.long()
             self.is_stage_transition = torch.logical_or(self.is_stage_transition, is_transition)
             self.keyframe_reset_buf |= self.is_stage_transition
@@ -493,7 +523,6 @@ class LeggedRobot(BaseTask):
 
         self.episode_length_buf += 1
         self.common_step_counter += 1
-        assert self.infer_keyframe_time == True
         if not self.cfg.dataset.real:
             self.motion_time += self._infer_dt()
         else:
@@ -580,18 +609,31 @@ class LeggedRobot(BaseTask):
         pass
 
     def _log_motion_tracking_info(self):
+        def safe_masked_mean(value, mask):
+            return value[mask].mean() if mask.any() else torch.zeros((), device=value.device, dtype=value.dtype)
+
         upper_body_diff = self.dif_global_body_pos[:, self.upper_keyframe_indices, :]
         lower_body_diff = self.dif_global_body_pos[:, self.lower_keyframe_indices, :]
         joint_pos_diff = self.dif_joint_angles
 
-        mask = self.is_stage_transition 
-        upper_body_diff_norm = upper_body_diff[mask].norm(dim=-1).mean()
-        lower_body_diff_norm = lower_body_diff[mask].norm(dim=-1).mean()
+        mask = self.is_stage_transition.bool()
+        upper_body_diff_norm = safe_masked_mean(upper_body_diff.norm(dim=-1), mask)
+        lower_body_diff_norm = safe_masked_mean(lower_body_diff.norm(dim=-1), mask)
         joint_pos_diff_norm = joint_pos_diff.norm(dim=-1).mean()
 
         self.extras['episode']["upper_body_diff_norm"] = upper_body_diff_norm
         self.extras['episode']["lower_body_diff_norm"] = lower_body_diff_norm
         self.extras['episode']["joint_pos_diff_norm"] = joint_pos_diff_norm
+        self.extras['episode']["full_dof_position_error"] = joint_pos_diff.abs().mean()
+        self.extras['episode']["full_body_local_position_error"] = self.dif_local_body_pos.norm(dim=-1).mean()
+        target_local_quat = quat_mul_inverse(self.motion_base_quat[:, None, :], self.motion_body_quat)
+        current_local_quat = quat_mul_inverse(self.base_quat[:, None, :], self.body_quat)
+        local_rot_angle = quat_to_angle_axis(quat_mul(target_local_quat, quat_conjugate(current_local_quat)))[0]
+        self.extras['episode']["full_body_local_rotation_error"] = local_rot_angle.abs().mean()
+        self.extras['episode']["reference_valid_ratio"] = self.motion_reference_valid.float().mean()
+        infer_dt = self._infer_dt()
+        self.extras['episode']["infer_dt_mean"] = infer_dt.mean()
+        self.extras['episode']["infer_dt_std"] = infer_dt.std(unbiased=False)
         
     def check_termination(self):
         """ Check if environments need to be reset
@@ -719,6 +761,14 @@ class LeggedRobot(BaseTask):
         if self.infer_keyframe_time:
             self.extras['env']['delta_time'] = self._infer_dt().mean()
             self.extras['env']['infer_curriculum'] = self.infer_curriculum.mean()
+            if self.phase_control_mode == "fixed_reference":
+                self.extras['env']['ignored_phase_action_mean'] = self.actions[:, -1].mean()
+                self.extras['env']['ignored_phase_action_std'] = self.actions[:, -1].std(unbiased=False)
+        else:
+            self.extras['env']['delta_time'] = self._infer_dt().mean()
+            self.extras['env']['phase_control_fixed'] = torch.tensor(
+                float(self.phase_control_mode == "fixed_reference"), device=self.device
+            )
         if self.cfg.dataset.real:
             self.extras['env']['warmup'] = self.warmup.float().mean()
             self.extras['env']['warmdown'] = self.warmdown_episode_len_buf.float().mean()
@@ -885,7 +935,12 @@ class LeggedRobot(BaseTask):
             name = self.reward_names[i]
             reward_group_name = name.split('_')[0]
             reward_group_index = self.reward_groups.index(reward_group_name)
-            rew = self.reward_functions[i]() * self.reward_scales[name]
+            raw_rew = self.reward_functions[i]()
+            rew = raw_rew * self.reward_scales[name]
+            if rew.ndim != 1 or rew.shape[0] != self.num_envs:
+                raise RuntimeError(
+                    f"Reward {name} must return shape ({self.num_envs},), got {tuple(rew.shape)}"
+                )
             if name in self.cfg.reward_penalty.reward_penalty_reward_names:
                 if self.cfg.reward_penalty.reward_penalty_curriculum:
                     rew *= self.reward_penalty_scale
@@ -893,28 +948,34 @@ class LeggedRobot(BaseTask):
             if self.apply_reward_scale and self.infer_keyframe_time and 'sparse' not in name:
                 rew *= self._infer_dt() / (self.dt * self.dt_scale)
 
+            self._record_sparse_reward_diagnostic(name, raw_rew, rew)
+
             self.rew_buf[:, reward_group_index] += rew
             self.episode_sums[name] += rew
 
             if 'termination' in name:
                 self.rew_buf_high[:, self.reward_groups.index('dense')] += rew
                 self.rew_buf_high[:, self.reward_groups.index('sparse')] += rew
-        
             if self.cfg.rewards.only_positive_rewards:
                 self.rew_buf[:, reward_group_index] = torch.clip(self.rew_buf[:, reward_group_index], min=0.)
-
         motion_body_pos = self.motion_body_pos - self.motion_base_pos[:, None]
         motion_body_pos = quat_rotate_inverse(self.motion_base_quat[:, None, :].repeat(1, motion_body_pos.shape[1], 1), motion_body_pos)
 
         cur_body_pos = self.body_pos - self.base_pos[:, None]
         cur_body_pos = quat_rotate_inverse(self.base_quat[:, None, :].repeat(1, cur_body_pos.shape[1], 1), cur_body_pos)
         self.dif_local_body_pos = cur_body_pos - motion_body_pos
-        
-        self.rew_buf_high[:, self.reward_groups.index('dense')] += -torch.norm(self.dif_local_body_pos, dim=-1).mean(dim=-1) * self._infer_dt() / (self.dt * self.dt_scale)
-        self.rew_buf_high[:, self.reward_groups.index('sparse')] += -torch.norm(self.dif_global_body_pos, dim=-1).mean(dim=-1) * self.is_stage_transition 
-        # self.rew_buf_high[:, self.reward_groups.index('dense')] += self._reward_tracking_body_position_local() * self._infer_dt() / (self.dt * self.dt_scale)
-        # self.rew_buf_high[:, self.reward_groups.index('sparse')] += self._reward_tracking_body_position()
 
+        # Preserve AdaMimic's separate high-critic proxy.  Both terms now use
+        # the current complete robot reference, never held sparse placeholders.
+        self.rew_buf_high[:, self.reward_groups.index('dense')] += (
+            -torch.norm(self.dif_local_body_pos, dim=-1).mean(dim=-1)
+            * self.motion_reference_valid.float()
+            * self._infer_dt() / (self.dt * self.dt_scale)
+        )
+        self.rew_buf_high[:, self.reward_groups.index('sparse')] += (
+            -torch.norm(self.dif_global_body_pos, dim=-1).mean(dim=-1)
+            * self.is_stage_transition * self.motion_reference_valid.float()
+        )
 
     def _update_heights_buffer(self, env_ids=None):
         if env_ids is None:
@@ -1718,6 +1779,14 @@ class LeggedRobot(BaseTask):
             self.motions = MotionLibAMP(dataset, mapping, self.dof_names, self.keyframe_names, self.cfg.dataset.frame_rate, self.cfg.dataset.min_time, device=self.device, \
                                     amp_obs_type=self.amp_obs_type, window_length=self.cfg.amp.num_steps, ratio_random_range=[0.95, 1.05], height_offset=self.cfg.dataset.height_offset)
 
+        if not self.amp and self.reference_mode_type in {"standard_full_gmr", "focused_full_gmr", "full_gmr_sparse"}:
+            if not bool(self.motions.reference_valid.all().item()):
+                raise ValueError(
+                    f"{self.reference_mode_type} requires reference_valid=true at every frame; "
+                    "the dataset contains a sparse/invalid robot reference"
+                )
+            print(f"[FullReference] mode={self.reference_mode_type}, fps={self.motions.fps}, all frames reference-valid")
+
         # Semantic trigger times are produced by the final VLM+SMPL-X
         # pipeline, not copied from a hand-written dataset YAML.
         if not self.amp and self.motions.event_times.numel():
@@ -1798,6 +1867,14 @@ class LeggedRobot(BaseTask):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
             Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
         """
+        # Keep both values: the resolved Hydra value is the user-facing reward
+        # scale, while AdaMimic's per-step integration uses the dt-scaled value.
+        # This makes it impossible to confuse a positive configured sparse
+        # similarity scale with a negative per-step contribution in a run log.
+        self.reward_scales_before_dt = {
+            key: float(value) for key, value in self.reward_scales.items()
+        }
+
         # remove zero scales + multiply non-zero ones by dt
         for key in list(self.reward_scales.keys()):
             scale = self.reward_scales[key]
@@ -1839,6 +1916,97 @@ class LeggedRobot(BaseTask):
         # reward episode sums
         self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
                              for name in self.reward_scales.keys()}
+
+        self._sparse_similarity_reward_names = (
+            "sparse_tracking_body_position",
+            "sparse_tracking_body_rot",
+            "sparse_tracking_body_position_feet",
+            "sparse_tracking_trunk_height",
+        )
+        if self.reference_mode_type == "full_gmr_sparse":
+            missing_sparse_rewards = [
+                name for name in self._sparse_similarity_reward_names
+                if name not in self.reward_names
+            ]
+            if missing_sparse_rewards:
+                raise RuntimeError(
+                    "The sparse keyframe reward contract requires all similarity rewards; "
+                    f"missing from registered reward_names: {missing_sparse_rewards}"
+                )
+            invalid_sparse_scales = {
+                name: self.reward_scales[name]
+                for name in self._sparse_similarity_reward_names
+                if self.reward_scales[name] <= 0.0
+            }
+            if invalid_sparse_scales:
+                raise RuntimeError(
+                    "Sparse similarity rewards must have strictly positive dt-scaled "
+                    f"scales, got {invalid_sparse_scales}"
+                )
+
+        self._sparse_reward_diagnostic_printed = set()
+        print("[RewardRegistration] reward_names=", self.reward_names)
+        print("[RewardRegistration] resolved_reward_scales_before_dt=", self.reward_scales_before_dt)
+        print("[RewardRegistration] runtime_reward_scales_after_dt=", self.reward_scales)
+
+    def _record_sparse_reward_diagnostic(self, name, raw_rew, scaled_rew):
+        """Check and expose the keyframe similarity reward sign at runtime.
+
+        The four sparse terms are exponentiated similarities.  On actual
+        keyframe-transition samples their raw value, configured scale, and
+        final low-level contribution must all be positive.  Termination is
+        intentionally excluded because it is the one sparse penalty.
+        """
+        if name not in self._sparse_similarity_reward_names:
+            return
+
+        keyframe_mask = self.is_stage_transition.bool()
+        if hasattr(self, "motion_reference_valid"):
+            keyframe_mask &= self.motion_reference_valid.bool()
+        if not torch.any(keyframe_mask):
+            return
+
+        raw_active = raw_rew[keyframe_mask]
+        scaled_active = scaled_rew[keyframe_mask]
+        scale = float(self.reward_scales[name])
+        if not torch.isfinite(raw_active).all() or not torch.isfinite(scaled_active).all():
+            raise RuntimeError(f"{name} produced a non-finite sparse reward at a keyframe")
+        if not scale > 0.0:
+            raise RuntimeError(f"{name} has non-positive dt-scaled reward scale {scale}")
+        if not torch.all(raw_active > 0.0):
+            raise RuntimeError(f"{name} raw similarity must be positive at a keyframe")
+        if not torch.all(scaled_active > 0.0):
+            raise RuntimeError(f"{name} scaled contribution must be positive at a keyframe")
+
+        # For the current positive similarity objective, -log(raw) is a
+        # monotonic tracking-error proxy.  This assert verifies that reducing
+        # that error strictly increases the final sparse objective.
+        if torch.all(raw_active <= 1.0):
+            error_proxy = -torch.log(raw_active.clamp_min(torch.finfo(raw_active.dtype).tiny))
+            improved_objective = scale * torch.exp(-0.5 * error_proxy)
+            # A perfect similarity has zero error, so no *strictly* smaller
+            # error exists.  Require strict improvement only for nonzero
+            # tracking error; equality at the optimum is expected.
+            improvable = error_proxy > 1e-6
+            if torch.any(improvable) and not torch.all(
+                improved_objective[improvable] > scaled_active[improvable]
+            ):
+                raise RuntimeError(
+                    f"{name} violates sparse objective monotonicity: lower tracking error "
+                    "did not improve the scaled reward"
+                )
+
+        # Do not inject event-only values into ``extras['episode']``: the
+        # runner batches reset infos and requires an identical key set for
+        # every reset.  The one-time console diagnostic below is persisted by
+        # the tmux log and is therefore safe for all episode lengths.
+        if name not in self._sparse_reward_diagnostic_printed:
+            print(
+                f"[SparseRewardDiagnostic] {name}: raw={raw_active.mean().item():.6f}, "
+                f"scale_after_dt={scale:.6f}, scaled={scaled_active.mean().item():.6f}, "
+                f"keyframe_samples={raw_active.numel()}"
+            )
+            self._sparse_reward_diagnostic_printed.add(name)
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
@@ -2702,14 +2870,16 @@ class LeggedRobot(BaseTask):
         reward = r_body_pos
 
         if self.special_scale:
-            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            # This must be bool.  With an empty special_scale_index, bitwise
+            # negation of a long zero is -1 and silently flips reward signs.
+            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
                 special = torch.logical_or(special, self.cur_keyframe_stage == index)
             reward *= self.special_scale_size * special + 1 * ~special
 
         if self.sparse_global:
             if self.cfg.dataset.keyframe_pos_direction is None:
-                return r_body_pos * self.is_stage_transition * self.motion_reference_valid
+                return reward * self.is_stage_transition * self.motion_reference_valid
             else:
                 special_scales = torch.tensor(self.cfg.dataset.special_scales, device=self.device, dtype=torch.float)
                 return r_body_pos * self.is_stage_transition * special_scales[self.is_offset_stage]
@@ -2765,21 +2935,23 @@ class LeggedRobot(BaseTask):
         return reward * (~self.motion_reference_valid)
 
     def _reward_tracking_human_joint_angle(self):
-        """Non-key joint-articulation reward in a signed semantic axis space."""
+        """Initial stable non-key joint-angle reward.
+
+        SMPL-X and G1 do not share calibrated local rotation axes.  Compare
+        the rotation magnitude of each semantic joint group instead of raw
+        axis-angle components, which preserves coarse articulation while
+        avoiding an arbitrary coordinate-frame correspondence.
+        """
         groups = getattr(self.cfg.dataset, "dense_human_robot_dof_groups", [])
         human_ids = getattr(self.cfg.dataset, "dense_human_angle_joint_indices", [])
-        component_maps = getattr(self.cfg.dataset, "dense_human_angle_component_maps", [])
-        signs = getattr(self.cfg.dataset, "dense_human_angle_signs", [])
-        if not (len(groups) == len(human_ids) == len(component_maps) == len(signs)):
+        if len(groups) != len(human_ids):
             raise ValueError("Human joint-angle mapping fields must have equal length")
         errors = []
-        for names, human_id, components, axis_signs in zip(groups, human_ids, component_maps, signs):
+        for names, human_id in zip(groups, human_ids):
             robot_ids = [self.dof_names.index(name) for name in names]
-            if len(robot_ids) != len(components) or len(robot_ids) != len(axis_signs):
-                raise ValueError(f"Invalid axis map for robot group {names}")
-            human_angle = self.motion_human_joint_axis_angle[:, human_id, components]
-            human_angle = human_angle * torch.tensor(axis_signs, device=self.device)
-            errors.append(torch.square(self.dof_pos[:, robot_ids] - human_angle).mean(dim=1))
+            robot_angle = torch.linalg.vector_norm(self.dof_pos[:, robot_ids], dim=1)
+            human_angle = torch.linalg.vector_norm(self.motion_human_joint_axis_angle[:, human_id], dim=1)
+            errors.append(torch.square(robot_angle - human_angle))
         if not errors:
             return torch.zeros(self.num_envs, device=self.device)
         error = torch.stack(errors, dim=1).mean(dim=1)
@@ -2823,14 +2995,14 @@ class LeggedRobot(BaseTask):
         reward = r_body_rot
 
         if self.special_scale:
-            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
                 special = torch.logical_or(special, self.cur_keyframe_stage == index)
             reward *= self.special_scale_size * special + 1 * ~special
 
         if self.sparse_global:
             if self.cfg.dataset.keyframe_pos_direction is None:
-                return r_body_rot * self.is_stage_transition
+                return reward * self.is_stage_transition * self.motion_reference_valid
             else:
                 special_scales = torch.tensor(self.cfg.dataset.special_scales, device=self.device, dtype=torch.float)
                 return r_body_rot * self.is_stage_transition * special_scales[self.is_offset_stage]
@@ -2844,6 +3016,7 @@ class LeggedRobot(BaseTask):
         rotation_diff = self.dif_local_body_rot
         diff_body_rot_dist = (rotation_diff**2).mean(dim=-1)#.mean(dim=-1)
         r_body_rot = torch.exp(-diff_body_rot_dist / self.cfg.rewards.reward_tracking_sigma.teleop_body_rot)
+        r_body_rot = r_body_rot * self.motion_reference_valid
 
         if self.sparse_local:
             return r_body_rot * self.is_stage_transition
@@ -2855,14 +3028,14 @@ class LeggedRobot(BaseTask):
         velocity_diff = self.dif_global_body_vel    
         diff_body_vel_dist = (velocity_diff**2).mean(dim=-1).mean(dim=-1)
         r_body_vel = torch.exp(-diff_body_vel_dist / self.cfg.rewards.reward_tracking_sigma.teleop_body_vel)
-        return r_body_vel
+        return r_body_vel * self.motion_reference_valid
     
     def _reward_tracking_body_ang_velocity(self):
         self.dif_global_body_ang_vel = self.motion_body_ang_vel - self.body_ang_vel
         ang_velocity_diff = self.dif_global_body_ang_vel
         diff_body_ang_vel_dist = (ang_velocity_diff**2).mean(dim=-1).mean(dim=-1)
         r_body_ang_vel = torch.exp(-diff_body_ang_vel_dist / self.cfg.rewards.reward_tracking_sigma.teleop_body_ang_vel)
-        return r_body_ang_vel
+        return r_body_ang_vel * self.motion_reference_valid
 
     def _reward_tracking_trunk_rot(self):
         coef = self.keyframe_weights[self.trunk_indices] / self.keyframe_weights[self.trunk_indices].sum()
@@ -2879,7 +3052,7 @@ class LeggedRobot(BaseTask):
         mean_diff_trunk_height = torch.sum(coef * torch.clip(torch.abs(diff_trunk_height) - 0.02, min=0.0), dim=1)
         reward = torch.exp(-self.cfg.rewards.reward_tracking_sigma.trunk_height_sigma * torch.square(mean_diff_trunk_height))
         if self.special_scale:
-            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
                 special = torch.logical_or(special, self.cur_keyframe_stage == index)
             reward *= self.special_scale_size * special + 1 * ~special
@@ -2900,30 +3073,33 @@ class LeggedRobot(BaseTask):
         reward = torch.exp(-diff_dof_pos / self.cfg.rewards.reward_tracking_sigma.dof_pos_sigma)
         # reward = tolerance(diff_dof_pos, [0, 0.5], 1, 0.1)
         if self.sparse_local:
-            return reward * self.is_stage_transition
+            return reward * self.is_stage_transition * self.motion_reference_valid
         else:
-            return reward #* self._infer_dt() / self.dt
+            return reward * self.motion_reference_valid #* self._infer_dt() / self.dt
 
     def _reward_tracking_dof_vel(self):
-        joint_vel_diff = self.motion_dof_vel * (self._infer_dt() / self.dt).unsqueeze(1) - self.dof_vel
+        if self.phase_control_mode == "fixed_reference":
+            joint_vel_diff = self.motion_dof_vel - self.dof_vel
+        else:
+            joint_vel_diff = self.motion_dof_vel * (self._infer_dt() / self.dt).unsqueeze(1) - self.dof_vel
         diff_dof_vel = (joint_vel_diff**2).mean(dim=-1)
         reward = torch.exp(-diff_dof_vel / self.cfg.rewards.reward_tracking_sigma.dof_vel_sigma)
         assert self.sparse_local == False
         if self.sparse_local:
             return reward * self.is_stage_transition
         else:
-            return reward #* self._infer_dt() / self.dt
+            return reward * self.motion_reference_valid #* self._infer_dt() / self.dt
 
     def _reward_tracking_base_lin_vel(self):
         diff_base_lin_vel = torch.norm(self.base_lin_vel - self.motion_base_lin_vel, dim=1)
         reward = torch.exp(-self.cfg.rewards.reward_tracking_sigma.base_lin_vel_sigma * torch.square(diff_base_lin_vel))
-        return reward
+        return reward * self.motion_reference_valid
     
     def _reward_feet_slippage(self):
         feet_lin_vel_xy = torch.norm(self.rigid_body_states[:, self.feet_contact_indices, 7:9], dim=2)
         feet_slippage = torch.sum(feet_lin_vel_xy * torch.all(self.contact_forces[:, self.feet_contact_indices, 2] >= 10, dim=1).float().unsqueeze(1), dim=1)
         reward = torch.exp(-self.cfg.rewards.feet_slippage_sigma * torch.square(feet_slippage))
-        return reward
+        return reward * self.motion_reference_valid
 
     def _reward_tracking_base_ang_vel(self):
         diff_base_ang_vel = torch.norm(self.base_ang_vel - self.motion_base_ang_vel, dim=1)
@@ -2939,7 +3115,7 @@ class LeggedRobot(BaseTask):
         diff_feet = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         reward = torch.exp(-diff_feet / self.cfg.rewards.reward_tracking_sigma.teleop_feet_pos)
         if self.special_scale:
-            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
                 special = torch.logical_or(special, self.cur_keyframe_stage == index)
             reward *= self.special_scale_size * special + 1 * ~special
@@ -2962,7 +3138,7 @@ class LeggedRobot(BaseTask):
         diff_feet = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         reward = torch.exp(-diff_feet / self.cfg.rewards.reward_tracking_sigma.teleop_feet_pos)
         if self.special_scale:
-            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+            special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
                 special = torch.logical_or(special, self.cur_keyframe_stage == index)
             reward *= self.special_scale_size * special + 1 * ~special
