@@ -48,19 +48,30 @@ def _upgrade_removed_legacy_omomo_dataset(cfg) -> None:
     # ``eval`` may be invoked without a dataset override, in which case the
     # structured base config does not contain these fields yet.
     with open_dict(cfg):
-        cfg.dataset.folder = str(_STANDARD_REFERENCE_ROOT)
-        cfg.dataset.joint_mapping = str(replacement_mapping)
-        cfg.reference_mode = {"type": "full_gmr_sparse"}
-        cfg.phase_control = {"mode": "fixed_reference", "fixed_dt_scale": 1.0}
-        cfg.algorithm.special_scale = False
-        for name in (
-            "dense_tracking_human_local_position",
-            "dense_tracking_human_joint_angle",
-            "dense_tracking_human_root_velocity",
-            "dense_tracking_human_heading",
-            "dense_tracking_human_feet_velocity",
-        ):
-            cfg.rewards.scales[name] = 0.0
+        config_scopes = [cfg]
+        if cfg.get("env") is not None:
+            config_scopes.append(cfg.env)
+        for scope in config_scopes:
+            scope.dataset = scope.get("dataset", {})
+            scope.dataset.folder = str(_STANDARD_REFERENCE_ROOT)
+            scope.dataset.joint_mapping = str(replacement_mapping)
+            scope.reference_mode = {"type": "full_gmr_sparse"}
+            scope.phase_control = {"mode": "fixed_reference", "fixed_dt_scale": 1.0}
+            scope.algorithm = scope.get("algorithm", {})
+            scope.algorithm.special_scale = False
+
+            rewards = scope.get("rewards")
+            if rewards is None:
+                continue
+            rewards.scales = rewards.get("scales", {})
+            for name in (
+                "dense_tracking_human_local_position",
+                "dense_tracking_human_joint_angle",
+                "dense_tracking_human_root_velocity",
+                "dense_tracking_human_heading",
+                "dense_tracking_human_feet_velocity",
+            ):
+                rewards.scales[name] = 0.0
 
 
 @hydra.main(config_path="../configs", config_name="eval", version_base="1.1")
