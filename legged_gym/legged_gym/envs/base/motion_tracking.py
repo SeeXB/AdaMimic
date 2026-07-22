@@ -1543,7 +1543,10 @@ class LeggedRobot(BaseTask):
 
         if self.visual_box_enabled:
             self.box_root_states[env_ids] = 0.0
-            self.box_root_states[env_ids, :3] = self.env_origins[env_ids] + self.visual_box_offset
+            # The robot is reset to a motion-dependent root pose, not merely
+            # to the terrain origin.  Anchor the diagnostic box to that final
+            # robot pose so their requested relative placement is invariant.
+            self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + self.visual_box_offset
             self.box_root_states[env_ids, 6] = 1.0
             actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
             env_ids_int32 = actor_ids.to(dtype=torch.int32)
