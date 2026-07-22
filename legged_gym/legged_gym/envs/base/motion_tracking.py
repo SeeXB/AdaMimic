@@ -1541,9 +1541,18 @@ class LeggedRobot(BaseTask):
         if self.cfg.noise.add_init_quat_noise:
             self.root_states[env_ids, 3:7] = quat_mul(self.root_states[env_ids, 3:7], self.init_quat_noise[env_ids])
 
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        if self.visual_box_enabled:
+            self.box_root_states[env_ids] = 0.0
+            self.box_root_states[env_ids, :3] = self.env_origins[env_ids] + self.visual_box_offset
+            self.box_root_states[env_ids, 6] = 1.0
+            actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
+            env_ids_int32 = actor_ids.to(dtype=torch.int32)
+            root_state_tensor = self.all_root_states.reshape(-1, 13)
+        else:
+            env_ids_int32 = env_ids.to(dtype=torch.int32)
+            root_state_tensor = self.root_states
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
+                                                     gymtorch.unwrap_tensor(root_state_tensor),
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
     def _push_robots(self):
@@ -1625,9 +1634,21 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         # create some wrapper tensors for different slices
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        all_root_states = gymtorch.wrap_tensor(actor_root_state)
+        if self.visual_box_enabled:
+            self.all_root_states = all_root_states.view(self.num_envs, 2, 13)
+            self.root_states = self.all_root_states[:, 0]
+            self.box_root_states = self.all_root_states[:, 1]
+        else:
+            self.all_root_states = all_root_states.view(self.num_envs, 1, 13)
+            self.root_states = self.all_root_states[:, 0]
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
-        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.num_bodies, 13)
+        all_rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(
+            self.num_envs, self.num_bodies + int(self.visual_box_enabled), 13
+        )
+        self.rigid_body_states = all_rigid_body_states[:, :self.num_bodies]
+        if self.visual_box_enabled:
+            self.box_rigid_body_states = all_rigid_body_states[:, self.num_bodies]
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
         self.base_quat = self.root_states[:, 3:7]
@@ -2083,6 +2104,18 @@ class LeggedRobot(BaseTask):
         asset_options.disable_gravity = self.cfg.asset.disable_gravity
 
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        box_cfg = getattr(self.cfg, "visual_box", {})
+        self.visual_box_enabled = bool(getattr(box_cfg, "enabled", False))
+        self.visual_box_handles = []
+        if self.visual_box_enabled:
+            size = getattr(box_cfg, "size", [0.45, 0.30, 0.28])
+            self.visual_box_size = [float(v) for v in size]
+            box_options = gymapi.AssetOptions()
+            box_options.density = float(getattr(box_cfg, "mass", 4.0)) / np.prod(self.visual_box_size)
+            box_options.angular_damping = 0.1
+            box_options.linear_damping = 0.02
+            self.visual_box_asset = self.gym.create_box(self.sim, *self.visual_box_size, box_options)
+            self.visual_box_offset = torch.tensor(getattr(box_cfg, "offset", [0.62, 0.0, 0.14]), device=self.device)
         self.num_dof = self.gym.get_asset_dof_count(robot_asset)
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
@@ -2149,6 +2182,12 @@ class LeggedRobot(BaseTask):
                     
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+            if self.visual_box_enabled:
+                box_pose = gymapi.Transform()
+                box_pose.p = gymapi.Vec3(*(pos + self.visual_box_offset).tolist())
+                box_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+                box_handle = self.gym.create_actor(env_handle, self.visual_box_asset, box_pose, "omomo_box", i, 0, 0)
+                self.visual_box_handles.append(box_handle)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
 
