@@ -87,13 +87,14 @@ def main(cfg):
     _upgrade_removed_legacy_omomo_dataset(cfg)
     with open_dict(cfg):
         # sub3_largebox_003: largebox OBJ bounds scaled by its OMOMO scale.
-        # ``object_position`` is its mesh-origin; center_offset converts it
-        # to the center expected by Isaac Gym's create_box actor.
+        # The reset path replaces this initial pose with the calibrated
+        # robot-local target; this floor-height value only avoids a transient
+        # floating prop while Isaac Gym builds the environment.
         cfg.env.visual_box = {
             "enabled": True,
             "size": [0.471, 0.458, 0.407],
             "mass": 4.0,
-            "center_offset": [0.0368, -0.0055, 0.1305],
+            "center_offset": [0.0, 0.0, 0.2035],
         }
     cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
     cfg.run_dir = HydraConfig.get().runtime.output_dir
