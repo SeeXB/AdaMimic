@@ -5,6 +5,8 @@ failed imitation is visible in the viewer instead of silently being masked.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import isaacgym  # Must be imported before torch.
 import hydra
 import torch
@@ -13,6 +15,49 @@ from omegaconf import OmegaConf
 
 from legged_gym.envs import *  # noqa: F401,F403
 from legged_gym.utils import AttrDict, task_registry
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[5]
+_STANDARD_REFERENCE_ROOT = _PROJECT_ROOT / "outputs" / "adamimic_full_reference" / "standard"
+
+
+def _upgrade_removed_legacy_omomo_dataset(cfg) -> None:
+    """Use the complete standard reference when an old sparse package is gone.
+
+    The old ``outputs/omomo_smplx/g1_dof29_joint_id.txt`` belonged to the
+    removed key-window-only package.  A full-reference checkpoint must replay
+    against the complete GMR package, which carries its own mapping file.
+    """
+    mapping = Path(str(cfg.dataset.joint_mapping))
+    if mapping.is_file():
+        return
+    legacy_root = _PROJECT_ROOT / "outputs" / "omomo_smplx"
+    if mapping.parent != legacy_root:
+        raise FileNotFoundError(f"Joint mapping does not exist: {mapping}")
+    replacement_mapping = _STANDARD_REFERENCE_ROOT / "joint_id.txt"
+    if not replacement_mapping.is_file():
+        raise FileNotFoundError(
+            f"Legacy OMOMO mapping was removed ({mapping}); expected replacement "
+            f"full-reference mapping at {replacement_mapping}"
+        )
+    print(
+        "[ReplayConfig] Legacy sparse OMOMO package was removed; replaying "
+        f"against standard full-reference package: {_STANDARD_REFERENCE_ROOT}"
+    )
+    cfg.dataset.folder = str(_STANDARD_REFERENCE_ROOT)
+    cfg.dataset.joint_mapping = str(replacement_mapping)
+    cfg.reference_mode.type = "full_gmr_sparse"
+    cfg.phase_control.mode = "fixed_reference"
+    cfg.phase_control.fixed_dt_scale = 1.0
+    cfg.algorithm.special_scale = False
+    for name in (
+        "dense_tracking_human_local_position",
+        "dense_tracking_human_joint_angle",
+        "dense_tracking_human_root_velocity",
+        "dense_tracking_human_heading",
+        "dense_tracking_human_feet_velocity",
+    ):
+        cfg.rewards.scales[name] = 0.0
 
 
 @hydra.main(config_path="../configs", config_name="eval", version_base="1.1")
@@ -25,6 +70,7 @@ def main(cfg):
     cfg.env.domain_rand.use_random = False
     cfg.env.algorithm.rsi = False
     cfg.env.terrain.curriculum = False
+    _upgrade_removed_legacy_omomo_dataset(cfg)
     cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
     cfg.run_dir = HydraConfig.get().runtime.output_dir
     env, env_cfg = task_registry.make_env_hydra(cfgs=cfg)
