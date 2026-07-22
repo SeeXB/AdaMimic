@@ -1435,6 +1435,7 @@ class LeggedRobot(BaseTask):
             self.motion_dict["base_quat"] = quat_mul(quat_dim, self.motion_dict["base_quat"])
             self.motion_dict['base_lin_vel'] = quat_rotate(quat_dim, self.motion_dict['base_lin_vel'])
             self.motion_dict['base_ang_vel'] = quat_rotate(quat_dim, self.motion_dict['base_ang_vel'])
+            self.motion_dict["object_pos"] = quat_rotate(quat_dim, self.motion_dict["object_pos"])
 
             quat_dim = quat[:, None, :].repeat(local_body_pos.shape[0], local_body_pos.shape[1], 1).clone()
             self.motion_dict["body_pos"] =  self.motion_dict["base_pos"][:, None, :] + quat_rotate(quat_dim, local_body_pos)
@@ -1445,9 +1446,11 @@ class LeggedRobot(BaseTask):
             if self.cfg.dataset.motion_x_offset is not None:
                 self.motion_dict["base_pos"][:, 0] += self.cfg.dataset.motion_x_offset
                 self.motion_dict["body_pos"][:, :, 0] += self.cfg.dataset.motion_x_offset
+                self.motion_dict["object_pos"][:, 0] += self.cfg.dataset.motion_x_offset
             if self.cfg.dataset.motion_z_offset is not None:
                 self.motion_dict["base_pos"][:, 2] += self.cfg.dataset.motion_z_offset
                 self.motion_dict["body_pos"][:, :, 2] += self.cfg.dataset.motion_z_offset
+                self.motion_dict["object_pos"][:, 2] += self.cfg.dataset.motion_z_offset
         else:
             euler_angle = torch.tensor(self.cfg.dataset.init_rotation, dtype=torch.float, device=self.device).unsqueeze(0)
             quat = euler_xyz_to_quat(euler_angle)
@@ -1458,6 +1461,7 @@ class LeggedRobot(BaseTask):
             self.motion_dict["base_quat"][env_ids] = quat_mul(quat_dim, self.motion_dict["base_quat"][env_ids])
             self.motion_dict['base_lin_vel'][env_ids] = quat_rotate(quat_dim, self.motion_dict['base_lin_vel'][env_ids])
             self.motion_dict['base_ang_vel'][env_ids] = quat_rotate(quat_dim, self.motion_dict['base_ang_vel'][env_ids])
+            self.motion_dict["object_pos"][env_ids] = quat_rotate(quat_dim, self.motion_dict["object_pos"][env_ids])
 
             quat_dim = quat[:, None, :].repeat(local_body_pos.shape[0], local_body_pos.shape[1], 1).clone()
             self.motion_dict["body_pos"][env_ids] =  self.motion_dict["base_pos"][env_ids][:, None, :] + quat_rotate(quat_dim, local_body_pos)
@@ -1468,9 +1472,11 @@ class LeggedRobot(BaseTask):
             if self.cfg.dataset.motion_x_offset is not None:
                 self.motion_dict["base_pos"][env_ids, 0] += self.cfg.dataset.motion_x_offset
                 self.motion_dict["body_pos"][env_ids, :, 0] += self.cfg.dataset.motion_x_offset
+                self.motion_dict["object_pos"][env_ids, 0] += self.cfg.dataset.motion_x_offset
             if self.cfg.dataset.motion_z_offset is not None:
                 self.motion_dict["base_pos"][env_ids, 2] += self.cfg.dataset.motion_z_offset
                 self.motion_dict["body_pos"][env_ids, :, 2] += self.cfg.dataset.motion_z_offset
+                self.motion_dict["object_pos"][env_ids, 2] += self.cfg.dataset.motion_z_offset
 
     def process_motion_state_input(self, motion_dict):
         """ Processes the motion state of the robot. 
@@ -1485,6 +1491,7 @@ class LeggedRobot(BaseTask):
         motion_dict["base_quat"] = quat_mul(quat_dim, motion_dict["base_quat"])
         motion_dict['base_lin_vel'] = quat_rotate(quat_dim, motion_dict['base_lin_vel'])
         motion_dict['base_ang_vel'] = quat_rotate(quat_dim, motion_dict['base_ang_vel'])
+        motion_dict["object_pos"] = quat_rotate(quat_dim, motion_dict["object_pos"])
 
         quat_dim = quat[:, None, :].repeat(local_body_pos.shape[0], local_body_pos.shape[1], 1).clone()
         motion_dict["body_pos"] =  motion_dict["base_pos"][:, None, :] + quat_rotate(quat_dim, local_body_pos)
@@ -1495,9 +1502,11 @@ class LeggedRobot(BaseTask):
         if self.cfg.dataset.motion_x_offset is not None:
             motion_dict["base_pos"][:, 0] += self.cfg.dataset.motion_x_offset
             motion_dict["body_pos"][:, :, 0] += self.cfg.dataset.motion_x_offset
+            motion_dict["object_pos"][:, 0] += self.cfg.dataset.motion_x_offset
         if self.cfg.dataset.motion_z_offset is not None:
             motion_dict["base_pos"][:, 2] += self.cfg.dataset.motion_z_offset
             motion_dict["body_pos"][:, :, 2] += self.cfg.dataset.motion_z_offset
+            motion_dict["object_pos"][:, 2] += self.cfg.dataset.motion_z_offset
         return motion_dict
 
     def _reset_root_states(self, env_ids):
@@ -1546,7 +1555,7 @@ class LeggedRobot(BaseTask):
             # OMOMO stores the object mesh origin in the same world frame as
             # the robot reference. Isaac Gym boxes use geometric centers.
             self.box_root_states[env_ids, :3] = (
-                self.env_origins[env_ids] + self.motion_dict["object_pos"][env_ids]
+                self.env_origin_offset[env_ids, :3] + self.motion_dict["object_pos"][env_ids]
                 + self.visual_box_center_offset
             )
             self.box_root_states[env_ids, 6] = 1.0
