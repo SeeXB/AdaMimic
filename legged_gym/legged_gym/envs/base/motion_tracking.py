@@ -1552,12 +1552,18 @@ class LeggedRobot(BaseTask):
 
         if self.visual_box_enabled:
             self.box_root_states[env_ids] = 0.0
-            # Map the human-root-local object center into the robot's current
-            # reference root frame; human and GMR world frames are distinct.
-            local_center = self.motion_dict["object_center_local"][env_ids]
+            # ``object_center_robot_local`` is produced by the dataset adapter
+            # through a wrist-based SMPL-X -> robot local-frame alignment.  A
+            # direct SMPL-X local offset would put the box on the G1's side
+            # because the two conventions use different forward/right axes.
+            local_center = self.motion_dict["object_center_robot_local"][env_ids]
             self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + quat_rotate(
                 self.root_states[env_ids, 3:7], local_center
             )
+            # The physical prop starts resting on the terrain.  Its SMPL-X
+            # local Z coordinate is not transferable because the two root
+            # frames use different vertical conventions.
+            self.box_root_states[env_ids, 2] = self.env_origins[env_ids, 2] + 0.5 * self.visual_box_size[2]
             self.box_root_states[env_ids, 6] = 1.0
             actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
             env_ids_int32 = actor_ids.to(dtype=torch.int32)
