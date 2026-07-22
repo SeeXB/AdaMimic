@@ -148,6 +148,7 @@ class MotionLib:
         self.human_root_vel_local = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
         self.human_heading_xy = torch.zeros(self.total_length, 2, dtype=torch.float, device=device)
         self.object_pos = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
+        self.object_center_local = torch.zeros(self.total_length, 3, dtype=torch.float, device=device)
 
         self.body_names = [name for name in body_names]
         self.event_names = datasets[0].get("event_names", [])
@@ -177,6 +178,8 @@ class MotionLib:
                 self.human_heading_xy[start:end] = data["human_heading_xy"][:-1].clone().detach()
             if "object_position" in data:
                 self.object_pos[start:end] = data["object_position"][:-1].clone().detach()
+            if "object_center_local" in data:
+                self.object_center_local[start:end] = data["object_center_local"][:-1].clone().detach()
             
             dof_pos = data["joint_position"][:-1].clone().detach()
             dof_vel = data.get("joint_velocity", (data["joint_position"][1:] - data["joint_position"][:-1]) * self.fps)
@@ -297,6 +300,7 @@ class MotionLib:
             human_root_vel_local=blend_motion(self.human_root_vel_local),
             human_heading_xy=blend_motion(self.human_heading_xy),
             object_pos=blend_motion(self.object_pos),
+            object_center_local=blend_motion(self.object_center_local),
 
             norm_time = norm_time
         )

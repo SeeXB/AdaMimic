@@ -1552,11 +1552,11 @@ class LeggedRobot(BaseTask):
 
         if self.visual_box_enabled:
             self.box_root_states[env_ids] = 0.0
-            # OMOMO stores the object mesh origin in the same world frame as
-            # the robot reference. Isaac Gym boxes use geometric centers.
-            self.box_root_states[env_ids, :3] = (
-                self.env_origin_offset[env_ids, :3] + self.motion_dict["object_pos"][env_ids]
-                + self.visual_box_center_offset
+            # Map the human-root-local object center into the robot's current
+            # reference root frame; human and GMR world frames are distinct.
+            local_center = self.motion_dict["object_center_local"][env_ids]
+            self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + quat_rotate(
+                self.root_states[env_ids, 3:7], local_center
             )
             self.box_root_states[env_ids, 6] = 1.0
             actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
