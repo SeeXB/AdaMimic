@@ -86,7 +86,15 @@ def main(cfg):
     cfg.env.terrain.curriculum = False
     _upgrade_removed_legacy_omomo_dataset(cfg)
     with open_dict(cfg):
-        cfg.env.visual_box = {"enabled": True, "size": [0.45, 0.30, 0.28], "mass": 4.0, "offset": [0.62, 0.0, 0.14]}
+        # sub3_largebox_003: largebox OBJ bounds scaled by its OMOMO scale.
+        # ``object_position`` is its mesh-origin; center_offset converts it
+        # to the center expected by Isaac Gym's create_box actor.
+        cfg.env.visual_box = {
+            "enabled": True,
+            "size": [0.471, 0.458, 0.407],
+            "mass": 4.0,
+            "center_offset": [0.0368, -0.0055, 0.1305],
+        }
     cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
     cfg.run_dir = HydraConfig.get().runtime.output_dir
     env, env_cfg = task_registry.make_env_hydra(cfgs=cfg)

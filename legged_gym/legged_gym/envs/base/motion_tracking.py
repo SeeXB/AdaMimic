@@ -1543,10 +1543,12 @@ class LeggedRobot(BaseTask):
 
         if self.visual_box_enabled:
             self.box_root_states[env_ids] = 0.0
-            # The robot is reset to a motion-dependent root pose, not merely
-            # to the terrain origin.  Anchor the diagnostic box to that final
-            # robot pose so their requested relative placement is invariant.
-            self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + self.visual_box_offset
+            # OMOMO stores the object mesh origin in the same world frame as
+            # the robot reference. Isaac Gym boxes use geometric centers.
+            self.box_root_states[env_ids, :3] = (
+                self.env_origins[env_ids] + self.motion_dict["object_pos"][env_ids]
+                + self.visual_box_center_offset
+            )
             self.box_root_states[env_ids, 6] = 1.0
             actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
             env_ids_int32 = actor_ids.to(dtype=torch.int32)
@@ -2118,7 +2120,9 @@ class LeggedRobot(BaseTask):
             box_options.angular_damping = 0.1
             box_options.linear_damping = 0.02
             self.visual_box_asset = self.gym.create_box(self.sim, *self.visual_box_size, box_options)
-            self.visual_box_offset = torch.tensor(getattr(box_cfg, "offset", [0.62, 0.0, 0.14]), device=self.device)
+            self.visual_box_center_offset = torch.tensor(
+                getattr(box_cfg, "center_offset", [0.0, 0.0, 0.5 * self.visual_box_size[2]]), device=self.device
+            )
         self.num_dof = self.gym.get_asset_dof_count(robot_asset)
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
@@ -2187,7 +2191,7 @@ class LeggedRobot(BaseTask):
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
             if self.visual_box_enabled:
                 box_pose = gymapi.Transform()
-                box_pose.p = gymapi.Vec3(*(pos + self.visual_box_offset).tolist())
+                box_pose.p = gymapi.Vec3(*(pos + self.visual_box_center_offset).tolist())
                 box_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
                 box_handle = self.gym.create_actor(env_handle, self.visual_box_asset, box_pose, "omomo_box", i, 0, 0)
                 self.visual_box_handles.append(box_handle)
