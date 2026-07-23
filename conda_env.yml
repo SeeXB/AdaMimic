@@ -1,17 +1,19 @@
 name: adamimic
 channels:
+  - conda-forge
   - defaults
+
 dependencies:
   - python=3.8
-  - tensorboard
-  - tqdm
+  - pip
   - numpy=1.20.3
-  - seaborn
-  - GitPython
   - pydelatin
   - pyfqmr
-  - hydra-core
-  - pip
-  - wandb
   - pip:
-    - git+https://github.com/KellerJordan/Muon
+      - tensorboard
+      - tqdm
+      - seaborn
+      - GitPython
+      - hydra-core
+      - wandb==0.17.9
+      - git+https://github.com/KellerJordan/Muon

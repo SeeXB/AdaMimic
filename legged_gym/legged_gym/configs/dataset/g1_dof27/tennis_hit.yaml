@@ -1,5 +1,6 @@
 
 defaults:
+  - /robot@_global_.robot: g1_dof27
   - tennis_hit
   - _self_
 

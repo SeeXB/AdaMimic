@@ -1556,7 +1556,10 @@ class LeggedRobot(BaseTask):
             # through a wrist-based SMPL-X -> robot local-frame alignment.  A
             # direct SMPL-X local offset would put the box on the G1's side
             # because the two conventions use different forward/right axes.
-            local_center = self.motion_dict["object_center_robot_local"][env_ids]
+            local_center = self.motion_dict["object_center_robot_local"][env_ids].clone()
+            # This is a visual/contact calibration only.  It leaves the
+            # retargeted GMR reference and exported object metadata intact.
+            local_center[:, :2] *= self.visual_box_horizontal_scale
             self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + quat_rotate(
                 self.root_states[env_ids, 3:7], local_center
             )
@@ -2129,7 +2132,15 @@ class LeggedRobot(BaseTask):
         self.visual_box_handles = []
         if self.visual_box_enabled:
             size = getattr(box_cfg, "size", [0.45, 0.30, 0.28])
+            if len(size) != 3 or any(float(value) <= 0.0 for value in size):
+                raise ValueError(f"visual_box.size must contain three positive values, got {size}")
             self.visual_box_size = [float(v) for v in size]
+            self.visual_box_horizontal_scale = float(getattr(box_cfg, "horizontal_scale", 1.0))
+            if self.visual_box_horizontal_scale <= 0.0:
+                raise ValueError(
+                    "visual_box.horizontal_scale must be positive, got "
+                    f"{self.visual_box_horizontal_scale}"
+                )
             box_options = gymapi.AssetOptions()
             box_options.density = float(getattr(box_cfg, "mass", 4.0)) / np.prod(self.visual_box_size)
             box_options.angular_damping = 0.1

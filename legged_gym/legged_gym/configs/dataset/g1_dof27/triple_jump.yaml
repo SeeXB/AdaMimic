@@ -1,4 +1,5 @@
 defaults:
+  - /robot@_global_.robot: g1_dof27
   - triple_jump
   - _self_
 

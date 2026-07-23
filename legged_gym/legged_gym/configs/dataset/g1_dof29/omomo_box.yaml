@@ -19,19 +19,14 @@ dataset:
   dense_human_foot_pair_indices: [11, 14]
   dense_human_angle_joint_indices: [1, 2, 4, 5, 7, 8, 9, 16, 17, 18, 19]
   dense_human_robot_dof_groups: [['left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint'], ['right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint'], ['left_knee_joint'], ['right_knee_joint'], ['left_ankle_pitch_joint', 'left_ankle_roll_joint'], ['right_ankle_pitch_joint', 'right_ankle_roll_joint'], ['waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint'], ['left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint'], ['right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint'], ['left_elbow_joint'], ['right_elbow_joint']]
-  # SMPL-X axis-angle components are [roll, pitch, yaw]. Robot group order is explicit.
-  dense_human_angle_component_maps: [[1, 0, 2], [1, 0, 2], [0], [0], [1, 0], [1, 0], [2, 0, 1], [1, 0, 2], [1, 0, 2], [0], [0]]
-  dense_human_angle_signs: [[1, 1, 1], [1, 1, 1], [1], [1], [1, 1], [1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1], [1], [1]]
 
 rewards:
   scales:
-    # Stage-1 non-key imitation deliberately has a single, smooth target.
-    # The sparse GMR targets remain responsible for the semantic events.  The
-    # velocity/heading terms caused a competing short-horizon objective and
-    # PPO collapsed after roughly 4k iterations; direct SMPL-X axis-angle
-    # components are not calibrated enough to be used as a reward yet.
+    # Initial stable formulation: a root-local keypoint target plus a coarse
+    # joint-angle magnitude target.  Sparse GMR references exclusively govern
+    # semantic key events; do not introduce velocity/heading objectives here.
     dense_tracking_human_local_position: 1.0
-    dense_tracking_human_joint_angle: 0.0
+    dense_tracking_human_joint_angle: 0.5
     dense_tracking_human_root_velocity: 0.0
     dense_tracking_human_heading: 0.0
     dense_tracking_human_feet_velocity: 0.0

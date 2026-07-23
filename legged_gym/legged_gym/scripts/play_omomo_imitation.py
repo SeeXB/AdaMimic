@@ -86,15 +86,16 @@ def main(cfg):
     cfg.env.terrain.curriculum = False
     _upgrade_removed_legacy_omomo_dataset(cfg)
     with open_dict(cfg):
-        # sub3_largebox_003: largebox OBJ bounds scaled by its OMOMO scale.
-        # The reset path replaces this initial pose with the calibrated
-        # robot-local target; this floor-height value only avoids a transient
-        # floating prop while Isaac Gym builds the environment.
+        # sub3_largebox_003: retain the OBJ aspect ratio but use a 0.75-scale
+        # visual proxy.  G1 is more compact than the human source skeleton.
+        # horizontal_scale is deliberately replay-only: it calibrates contact
+        # inspection without modifying the exported GMR/object reference.
         cfg.env.visual_box = {
             "enabled": True,
-            "size": [0.471, 0.458, 0.407],
+            "size": [0.353, 0.344, 0.305],
             "mass": 4.0,
-            "center_offset": [0.0, 0.0, 0.2035],
+            "center_offset": [0.0, 0.0, 0.1525],
+            "horizontal_scale": 0.65,
         }
     cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
     cfg.run_dir = HydraConfig.get().runtime.output_dir

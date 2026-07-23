@@ -1,0 +1,14 @@
+{
+  "checkpoint": "/home/aozhou/shixiongbo/GMR/third_party/AdaMimic/exp/g1_dof29/omomo_box/adamimic_stage1/20260717_012137_g1_dof29_omomo_box_adamimic_stage1_omomo_box_keyframe_preference_20260717_012134/model_8000.pt",
+  "num_envs": 1,
+  "max_steps": 2,
+  "completed_episodes": 0,
+  "timeout_completion_rate": 0.0,
+  "mean_terminated_episode_length_steps": 0.0,
+  "nonkey_human_position_rmse_m": 0.35178850609453255,
+  "nonkey_human_joint_angle_rmse_deg": 47.67672677069344,
+  "nonkey_root_velocity_rmse_mps": 1.2792952287580852,
+  "nonkey_heading_rmse": 0.8634406413001492,
+  "nonkey_feet_velocity_rmse_mps": 1.6828016348664854,
+  "keyframe_link_position_rmse_m": 0.0
+}
