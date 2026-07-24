@@ -154,7 +154,8 @@ class MotionLib:
         self.body_names = [name for name in body_names]
         self.event_names = datasets[0].get("event_names", [])
         event_frames = datasets[0].get("event_trigger_frames", torch.empty(0, dtype=torch.long))
-        self.event_times = torch.as_tensor(event_frames, dtype=torch.float, device=device) / self.fps
+        self.event_trigger_frames = torch.as_tensor(event_frames, dtype=torch.long, device=device)
+        self.event_times = self.event_trigger_frames.to(dtype=torch.float) / self.fps
         print(body_names)
 
         print(f"Moving motion dataset to {self.device}...")

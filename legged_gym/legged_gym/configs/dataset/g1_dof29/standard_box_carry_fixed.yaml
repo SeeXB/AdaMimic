@@ -1,0 +1,99 @@
+defaults:
+  - /robot@_global_.robot: g1_dof29
+  - /dataset/badminton_hit@_here_
+  - _self_
+
+task_id: standard_box_carry_fixed
+reference_mode:
+  type: full_gmr_sparse
+phase_control:
+  mode: fixed_reference
+  fixed_dt_scale: 1.0
+dataset:
+  folder: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard
+  joint_mapping: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard/joint_id.txt
+  keyframe_times: []
+  keyframe_pos_index: []
+  special_scale_index: []
+semantic_keyframes:
+  start: start
+  approach: approach
+  contact: contact
+  lift: lift
+  carry_mid: carry_mid
+  arrive: arrive
+  place: place
+  release: release
+object_interaction:
+  enabled: true
+  object_type: box
+  size: [0.353, 0.344, 0.305]
+  mass: 4.0
+  friction: 1.0
+  restitution: 0.0
+  angular_damping: 0.1
+  linear_damping: 0.02
+  fixed_orientation: true
+  initial_yaw: 0.0
+box_carry_task:
+  enabled: true
+  demo_box_distance: 0.42
+  demo_carry_distance: 0.35
+  demo_lateral_offset: 0.0
+  box_distance_range: [0.42, 0.42]
+  carry_distance_range: [0.35, 0.35]
+  offset_axis: robot_forward
+  fixed_box_yaw: true
+  base_actor_observation_dim: 100
+  command_normalization: 1.0
+  left_hand_body_name: left_rubber_hand
+  right_hand_body_name: right_rubber_hand
+  hand_contact_offset: [0.055, 0.0, 0.0]
+  contact_surface_margin: 0.035
+  min_surface_clearance: 0.015
+  contact_patch_margin: 0.04
+  contact_distance_threshold: 0.14
+  contact_penetration_tolerance: 0.04
+  penetration_active_distance: 0.18
+  max_penetration_penalty: 0.05
+  require_opposite_contact_sides: false
+  contact_velocity_tolerance: 0.75
+  contact_hold_steps: 3
+  lift_threshold: 0.08
+  max_tilt: 0.65
+  lift_hold_steps: 3
+  goal_position_threshold: 0.12
+  arrive_hold_steps: 3
+  place_height_threshold: 0.035
+  place_linear_velocity_threshold: 0.20
+  place_angular_velocity_threshold: 1.0
+  place_hold_steps: 8
+  release_distance_threshold: 0.16
+  release_hold_steps: 8
+  drop_height_threshold: 0.05
+  drop_hold_steps: 15
+  max_box_robot_distance: 3.0
+  max_progress_per_step: 0.05
+  approach_sigma: 0.35
+  place_position_sigma: 0.12
+  place_height_sigma: 0.04
+  place_velocity_sigma: 0.35
+box_carry_observation:
+  num_one_step_observations: 109
+  num_observations: 545
+  num_privileged_obs: 145
+  num_privileged_obs_high: 145
+rewards:
+  scales:
+    dense_box_hand_approach: 1.0
+    dense_box_hand_penetration: -0.5
+    dense_box_contact_proxy: 0.5
+    dense_box_lift: 2.0
+    dense_box_transport: 5.0
+    dense_box_place: 2.0
+    dense_box_release: 2.0
+    dense_tracking_human_local_position: 0.0
+    dense_tracking_human_joint_angle: 0.0
+    dense_tracking_human_root_velocity: 0.0
+    dense_tracking_human_heading: 0.0
+    dense_tracking_human_feet_velocity: 0.0

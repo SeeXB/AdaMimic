@@ -60,6 +60,11 @@ from legged_gym.utils.motionlib import (
     MotionLibAMP, 
     load_imitation_dataset
 )
+from legged_gym.envs.base.box_carry import (
+    SEMANTIC_ROLE_ORDER,
+    resolve_semantic_keyframes,
+    smooth_box_carry_offset,
+)
 
 
 def euler_from_quaternion(quat_angle):
@@ -568,6 +573,10 @@ class LeggedRobot(BaseTask):
         self._post_physics_step_callback()
         self.compute_motions()
         self._setup_motion_state()
+        # This edit is applied before global deviation/keyframe checks.  The
+        # following dense local reward cancels this common translation.
+        self.apply_box_carry_keyframe_offsets()
+        self._update_box_carry_state()
         self._pre_compute_observations_callback()
         # compute observations, rewards, resets, ...
         self.compute_deviation_time()
@@ -660,6 +669,12 @@ class LeggedRobot(BaseTask):
             dof_error = (self.motion_dof_pos - self.dof_pos).max(dim=-1)[0] > (self.cfg.termination_curriculum.terminate_when_motion_far_threshold_max / 2)
             self.reset_buf |= dof_error
 
+        if self.box_carry_enabled:
+            too_far = torch.linalg.vector_norm(
+                self.box_pos[:, :2] - self.root_states[:, :2], dim=1
+            ) > float(self.cfg.box_carry_task.max_box_robot_distance)
+            self.reset_buf |= too_far | self.box_dropped
+
         # print(self.motion_time)
         # self.reset_buf[:] = self.motions.check_timeout(self.motion_ids[:], self.motion_time[:])
 
@@ -687,6 +702,8 @@ class LeggedRobot(BaseTask):
         self.extras["time_outs"] = self.time_out_buf
         self.extras['success'] = ~self.episode_failed_buf
         self.extras["completions"] = self.episode_length_buf * self.dt / motion_time
+        if self.box_carry_enabled:
+            self.extras["episode"].update(self._box_carry_metrics(env_ids))
 
         # reset robot states
         self._reset_motions(env_ids)
@@ -1093,8 +1110,22 @@ class LeggedRobot(BaseTask):
             print("has nan!")
             current_obs = torch.zeros((self.envs, 9 + self.num_dof * 2 + 3), dtype = torch.float, devices=self.device)
 
+        # The task-conditioned actor receives the existing 100-D actor prefix
+        # plus nine oracle box/command values.  Privileged state appends the
+        # same block to the complete baseline critic observation.
+        if self.box_carry_enabled:
+            base_actor_dim = int(self.cfg.box_carry_task.base_actor_observation_dim)
+            task_obs = self._box_carry_observation()
+            current_actor_obs = torch.cat((current_obs[:, :base_actor_dim], task_obs), dim=-1)
+            current_obs = torch.cat((current_obs, task_obs), dim=-1)
+            if current_actor_obs.shape[1] != self.num_one_step_obs:
+                raise RuntimeError(f"Box-carry actor observation has {current_actor_obs.shape[1]} dims, expected {self.num_one_step_obs}")
+            if current_obs.shape[1] != self.num_privileged_obs:
+                raise RuntimeError(f"Box-carry privileged observation has {current_obs.shape[1]} dims, expected {self.num_privileged_obs}")
+        else:
+            current_actor_obs = torch.clone(current_obs[:,:self.num_one_step_obs])
+
         # add noise if needed
-        current_actor_obs = torch.clone(current_obs[:,:self.num_one_step_obs])
         if self.add_noise:
             current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec[0:current_actor_obs.shape[1]]
             current_actor_obs[:, (6 + 2 * self.num_dof + self.num_dof + 4):(6 + 2 * self.num_dof + self.num_dof + 7)] += self.cum_odometry_drift
@@ -1143,6 +1174,10 @@ class LeggedRobot(BaseTask):
                                         self.base_lin_vel * self.obs_scales.lin_vel,
                                         self.motion_dof_pos,
                                         ),dim=-1)
+        if self.box_carry_enabled:
+            current_obs = torch.cat((current_obs, self._box_carry_observation()), dim=-1)
+            if current_obs.shape[1] != self.num_privileged_obs:
+                raise RuntimeError(f"Box-carry termination observation has {current_obs.shape[1]} dims, expected {self.num_privileged_obs}")
         return current_obs[env_ids]
     
         
@@ -1416,7 +1451,12 @@ class LeggedRobot(BaseTask):
         self.dof_vel[env_ids] = 0.
         self.dof_vel[env_ids]= motion_dof_vel
 
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        # ``set_dof_state_tensor_indexed`` takes simulation-domain *actor*
+        # indices, not environment indices.  They happen to be equal in a
+        # robot-only scene, but become 0, 2, 4, ... once every environment
+        # also owns a box actor.  Passing env_ids then addresses box actors
+        # (which have zero DoFs) and triggers a PhysX GPU illegal access.
+        env_ids_int32 = self.robot_actor_sim_indices[env_ids].to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
@@ -1550,30 +1590,26 @@ class LeggedRobot(BaseTask):
         if self.cfg.noise.add_init_quat_noise:
             self.root_states[env_ids, 3:7] = quat_mul(self.root_states[env_ids, 3:7], self.init_quat_noise[env_ids])
 
-        if self.visual_box_enabled:
+        if self.box_enabled:
             self.box_root_states[env_ids] = 0.0
-            # ``object_center_robot_local`` is produced by the dataset adapter
-            # through a wrist-based SMPL-X -> robot local-frame alignment.  A
-            # direct SMPL-X local offset would put the box on the G1's side
-            # because the two conventions use different forward/right axes.
-            local_center = self.motion_dict["object_center_robot_local"][env_ids].clone()
-            # This is a visual/contact calibration only.  It leaves the
-            # retargeted GMR reference and exported object metadata intact.
-            local_center[:, :2] *= self.visual_box_horizontal_scale
-            self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + quat_rotate(
-                self.root_states[env_ids, 3:7], local_center
-            )
-            # The physical prop starts resting on the terrain.  Its SMPL-X
-            # local Z coordinate is not transferable because the two root
-            # frames use different vertical conventions.
-            self.box_root_states[env_ids, 2] = self.env_origins[env_ids, 2] + 0.5 * self.visual_box_size[2]
-            self.box_root_states[env_ids, 6] = 1.0
-            actor_ids = torch.stack((2 * env_ids, 2 * env_ids + 1), dim=1).flatten()
+            if self.box_carry_enabled:
+                self._reset_box_carry_task(env_ids)
+            else:
+                # Backward-compatible replay placement.  It intentionally
+                # retains the prior dataset calibration semantics.
+                local_center = self.motion_dict["object_center_robot_local"][env_ids].clone()
+                local_center[:, :2] *= self.box_horizontal_scale
+                self.box_root_states[env_ids, :3] = self.root_states[env_ids, :3] + quat_rotate(
+                    self.root_states[env_ids, 3:7], local_center
+                )
+                self.box_root_states[env_ids, 2] = self.env_origins[env_ids, 2] + 0.5 * self.box_size[2]
+                self.box_root_states[env_ids, 6] = 1.0
+            actor_ids = torch.cat((self.robot_actor_sim_indices[env_ids], self.box_actor_sim_indices[env_ids]))
             env_ids_int32 = actor_ids.to(dtype=torch.int32)
             root_state_tensor = self.all_root_states.reshape(-1, 13)
         else:
-            env_ids_int32 = env_ids.to(dtype=torch.int32)
-            root_state_tensor = self.root_states
+            env_ids_int32 = self.robot_actor_sim_indices[env_ids].to(dtype=torch.int32)
+            root_state_tensor = self.all_root_states.reshape(-1, 13)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(root_state_tensor),
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
@@ -1583,7 +1619,7 @@ class LeggedRobot(BaseTask):
         """
         max_vel = self.cfg.domain_rand.max_push_vel_xy
         self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.all_root_states.reshape(-1, 13)))
 
     def _update_terrain_curriculum(self, env_ids):
         """ Implements the game-inspired curriculum.
@@ -1656,22 +1692,55 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
-        # create some wrapper tensors for different slices
-        all_root_states = gymtorch.wrap_tensor(actor_root_state)
-        if self.visual_box_enabled:
-            self.all_root_states = all_root_states.view(self.num_envs, 2, 13)
-            self.root_states = self.all_root_states[:, 0]
-            self.box_root_states = self.all_root_states[:, 1]
-        else:
-            self.all_root_states = all_root_states.view(self.num_envs, 1, 13)
-            self.root_states = self.all_root_states[:, 0]
+        # Actor and rigid-body simulation indices are captured at creation.
+        # Derive local slots from those indices instead of assuming robot=2*i
+        # and box=2*i+1.  The per-env layout is validated before making views.
+        raw_root_states = gymtorch.wrap_tensor(actor_root_state)
+        if raw_root_states.shape[0] % self.num_envs:
+            raise RuntimeError("Actor root-state tensor is not divisible by num_envs")
+        self.actors_per_env = raw_root_states.shape[0] // self.num_envs
+        env_index = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        self.robot_actor_sim_indices = torch.as_tensor(self.robot_actor_sim_indices, device=self.device, dtype=torch.long)
+        robot_slots = self.robot_actor_sim_indices - env_index * self.actors_per_env
+        if not torch.all((robot_slots >= 0) & (robot_slots < self.actors_per_env)):
+            raise RuntimeError("Robot simulation actor indices do not match root-state layout")
+        if robot_slots.unique().numel() != 1:
+            raise RuntimeError("Robot actor slot is inconsistent across environments")
+        self.all_root_states = raw_root_states.view(self.num_envs, self.actors_per_env, 13)
+        self.root_states = self.all_root_states[:, int(robot_slots[0].item())]
+        self.box_root_states = None
+        if self.box_enabled:
+            self.box_actor_sim_indices = torch.as_tensor(self.box_actor_sim_indices, device=self.device, dtype=torch.long)
+            box_slots = self.box_actor_sim_indices - env_index * self.actors_per_env
+            if not torch.all((box_slots >= 0) & (box_slots < self.actors_per_env)):
+                raise RuntimeError("Box simulation actor indices do not match root-state layout")
+            if box_slots.unique().numel() != 1:
+                raise RuntimeError("Box actor slot is inconsistent across environments")
+            self.box_root_states = self.all_root_states[:, int(box_slots[0].item())]
+            self.box_pos = self.box_root_states[:, :3]
+            self.box_quat = self.box_root_states[:, 3:7]
+            self.box_lin_vel = self.box_root_states[:, 7:10]
+            self.box_ang_vel = self.box_root_states[:, 10:13]
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
-        all_rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(
-            self.num_envs, self.num_bodies + int(self.visual_box_enabled), 13
-        )
+        raw_rigid_body_states = gymtorch.wrap_tensor(rigid_body_state)
+        if raw_rigid_body_states.shape[0] % self.num_envs:
+            raise RuntimeError("Rigid-body state tensor is not divisible by num_envs")
+        self.rigid_bodies_per_env = raw_rigid_body_states.shape[0] // self.num_envs
+        all_rigid_body_states = raw_rigid_body_states.view(self.num_envs, self.rigid_bodies_per_env, 13)
+        robot_rigid_indices = torch.as_tensor(self.robot_rigid_body_sim_indices, device=self.device, dtype=torch.long)
+        expected_robot_indices = env_index[:, None] * self.rigid_bodies_per_env + torch.arange(self.num_bodies, device=self.device)
+        if not torch.equal(robot_rigid_indices, expected_robot_indices):
+            raise RuntimeError("Robot rigid-body indices are not contiguous in each environment")
         self.rigid_body_states = all_rigid_body_states[:, :self.num_bodies]
-        if self.visual_box_enabled:
-            self.box_rigid_body_states = all_rigid_body_states[:, self.num_bodies]
+        self.box_rigid_body_states = None
+        if self.box_enabled:
+            self.box_rigid_body_sim_indices = torch.as_tensor(self.box_rigid_body_sim_indices, device=self.device, dtype=torch.long)
+            box_slots = self.box_rigid_body_sim_indices - env_index * self.rigid_bodies_per_env
+            if not torch.all((box_slots >= 0) & (box_slots < self.rigid_bodies_per_env)):
+                raise RuntimeError("Box rigid-body indices do not match rigid-state layout")
+            if box_slots.unique().numel() != 1:
+                raise RuntimeError("Box rigid-body slot is inconsistent across environments")
+            self.box_rigid_body_states = all_rigid_body_states[:, int(box_slots[0].item())]
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
         self.base_quat = self.root_states[:, 3:7]
@@ -1683,7 +1752,11 @@ class LeggedRobot(BaseTask):
         self.right_feet_pos = self.rigid_body_states.view(self.num_envs, self.num_bodies, 13)[:, self.right_feet_indices, 0:3]
     
         self.feet_contacts = torch.zeros(self.num_envs, 2, len(self.feet_contact_indices), dtype=torch.bool, device=self.device)
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
+        self.all_contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, self.rigid_bodies_per_env, 3)
+        self.contact_forces = self.all_contact_forces[:, :self.num_bodies]
+        self.box_contact_forces = None
+        if self.box_enabled:
+            self.box_contact_forces = self.all_contact_forces[:, int(box_slots[0].item())]
         self._setup_tensor_state()
         # initialize some data used later on
         self.common_step_counter = 0
@@ -1854,6 +1927,7 @@ class LeggedRobot(BaseTask):
 
 
         self._setup_motion_state()
+        self._init_box_carry_task()
         self.deviation_time = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         
         #
@@ -2127,28 +2201,50 @@ class LeggedRobot(BaseTask):
         asset_options.disable_gravity = self.cfg.asset.disable_gravity
 
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
-        box_cfg = getattr(self.cfg, "visual_box", {})
-        self.visual_box_enabled = bool(getattr(box_cfg, "enabled", False))
+        # ``visual_box`` remains a backward-compatible replay alias.  New
+        # training tasks use ``object_interaction`` and share the exact same
+        # physical actor path.
+        legacy_box_cfg = getattr(self.cfg, "visual_box", {})
+        object_cfg = getattr(self.cfg, "object_interaction", {})
+        self.object_interaction_enabled = bool(getattr(object_cfg, "enabled", False))
+        self.visual_box_enabled = bool(getattr(legacy_box_cfg, "enabled", False))
+        self.box_enabled = self.object_interaction_enabled or self.visual_box_enabled
+        self.box_cfg = object_cfg if self.object_interaction_enabled else legacy_box_cfg
         self.visual_box_handles = []
-        if self.visual_box_enabled:
-            size = getattr(box_cfg, "size", [0.45, 0.30, 0.28])
+        self.box_actor_sim_indices, self.box_rigid_body_sim_indices = [], []
+        self.robot_actor_sim_indices, self.robot_rigid_body_sim_indices = [], []
+        if self.box_enabled:
+            size = getattr(self.box_cfg, "size", [0.45, 0.30, 0.28])
             if len(size) != 3 or any(float(value) <= 0.0 for value in size):
-                raise ValueError(f"visual_box.size must contain three positive values, got {size}")
-            self.visual_box_size = [float(v) for v in size]
-            self.visual_box_horizontal_scale = float(getattr(box_cfg, "horizontal_scale", 1.0))
-            if self.visual_box_horizontal_scale <= 0.0:
+                raise ValueError(f"object_interaction.size must contain three positive values, got {size}")
+            self.box_size = [float(v) for v in size]
+            self.box_horizontal_scale = float(getattr(self.box_cfg, "horizontal_scale", 1.0))
+            if self.box_horizontal_scale <= 0.0:
                 raise ValueError(
-                    "visual_box.horizontal_scale must be positive, got "
-                    f"{self.visual_box_horizontal_scale}"
+                    "object_interaction.horizontal_scale must be positive, got "
+                    f"{self.box_horizontal_scale}"
                 )
             box_options = gymapi.AssetOptions()
-            box_options.density = float(getattr(box_cfg, "mass", 4.0)) / np.prod(self.visual_box_size)
-            box_options.angular_damping = 0.1
-            box_options.linear_damping = 0.02
-            self.visual_box_asset = self.gym.create_box(self.sim, *self.visual_box_size, box_options)
-            self.visual_box_center_offset = torch.tensor(
-                getattr(box_cfg, "center_offset", [0.0, 0.0, 0.5 * self.visual_box_size[2]]), device=self.device
+            box_options.density = float(getattr(self.box_cfg, "mass", 4.0)) / np.prod(self.box_size)
+            box_options.angular_damping = float(getattr(self.box_cfg, "angular_damping", 0.1))
+            box_options.linear_damping = float(getattr(self.box_cfg, "linear_damping", 0.02))
+            box_options.disable_gravity = False
+            self.box_asset = self.gym.create_box(self.sim, *self.box_size, box_options)
+            # Configure the shared asset material before actors are created.
+            # This avoids any per-actor material mutation and makes the task
+            # config's friction/restitution effective in every environment.
+            box_shape_props = self.gym.get_asset_rigid_shape_properties(self.box_asset)
+            for shape in box_shape_props:
+                shape.friction = float(getattr(self.box_cfg, "friction", 1.0))
+                shape.restitution = float(getattr(self.box_cfg, "restitution", 0.0))
+            self.gym.set_asset_rigid_shape_properties(self.box_asset, box_shape_props)
+            self.box_center_offset = torch.tensor(
+                getattr(self.box_cfg, "center_offset", [0.0, 0.0, 0.5 * self.box_size[2]]), device=self.device
             )
+            # Legacy replay code still reads these names.
+            self.visual_box_size = self.box_size
+            self.visual_box_horizontal_scale = self.box_horizontal_scale
+            self.visual_box_center_offset = self.box_center_offset
         self.num_dof = self.gym.get_asset_dof_count(robot_asset)
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
@@ -2215,12 +2311,28 @@ class LeggedRobot(BaseTask):
                     
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
-            if self.visual_box_enabled:
+            if self.box_enabled:
                 box_pose = gymapi.Transform()
-                box_pose.p = gymapi.Vec3(*(pos + self.visual_box_center_offset).tolist())
+                # The task reset writes the sampled physical box pose before
+                # the first simulation step.  Create it high above the robot
+                # meanwhile: spawning a dynamic box through the robot's
+                # torso creates a deep initial penetration that can poison
+                # GPU PhysX contact initialization before reset is reached.
+                initial_box_spawn = pos.clone()
+                initial_box_spawn[2] += max(2.0, float(self.box_size[2]) + 0.5)
+                box_pose.p = gymapi.Vec3(*initial_box_spawn.tolist())
                 box_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-                box_handle = self.gym.create_actor(env_handle, self.visual_box_asset, box_pose, "omomo_box", i, 0, 0)
+                box_handle = self.gym.create_actor(env_handle, self.box_asset, box_pose, "omomo_box", i, 0, 0)
                 self.visual_box_handles.append(box_handle)
+                self.box_actor_sim_indices.append(self.gym.get_actor_index(env_handle, box_handle, gymapi.DOMAIN_SIM))
+                self.box_rigid_body_sim_indices.append(
+                    self.gym.get_actor_rigid_body_index(env_handle, box_handle, 0, gymapi.DOMAIN_SIM)
+                )
+            self.robot_actor_sim_indices.append(self.gym.get_actor_index(env_handle, actor_handle, gymapi.DOMAIN_SIM))
+            self.robot_rigid_body_sim_indices.append([
+                self.gym.get_actor_rigid_body_index(env_handle, actor_handle, body_id, gymapi.DOMAIN_SIM)
+                for body_id in range(self.num_bodies)
+            ])
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
 
@@ -2401,6 +2513,20 @@ class LeggedRobot(BaseTask):
         self.dt = self.cfg.control.decimation * self.sim_params.dt
         self.obs_scales = self.cfg.normalization.obs_scales
         self.reward_scales = self.cfg.rewards.scales
+        object_cfg = getattr(self.cfg, "object_interaction", None)
+        task_cfg = getattr(self.cfg, "box_carry_task", None)
+        self.object_interaction_enabled = bool(getattr(object_cfg, "enabled", False))
+        self.box_carry_enabled = bool(getattr(task_cfg, "enabled", False))
+        if self.box_carry_enabled and not self.object_interaction_enabled:
+            raise ValueError("box_carry_task.enabled requires object_interaction.enabled")
+        if self.box_carry_enabled:
+            observation_cfg = getattr(self.cfg, "box_carry_observation", None)
+            if observation_cfg is None:
+                raise ValueError("box_carry_task.enabled requires box_carry_observation dimensions")
+            for name in ("num_one_step_observations", "num_observations", "num_privileged_obs", "num_privileged_obs_high"):
+                if not hasattr(observation_cfg, name):
+                    raise ValueError(f"box_carry_observation is missing {name}")
+                setattr(self.cfg.env, name, int(getattr(observation_cfg, name)))
         if self.cfg.terrain.mesh_type not in ['heightfield', 'trimesh']:
             self.cfg.terrain.curriculum = False
         self.max_episode_length_s = self.cfg.env.episode_length_s
@@ -2797,6 +2923,354 @@ class LeggedRobot(BaseTask):
         self.motion_human_heading_xy = self.motion_dict["human_heading_xy"][:]
         self.motion_object_pos = self.motion_dict["object_pos"][:]
 
+    #------------ task-conditioned physical box carry ----------------
+    def _init_box_carry_task(self):
+        """Allocate task state and resolve semantic events once at startup."""
+        if not self.box_carry_enabled:
+            return
+        if not self.box_enabled:
+            raise RuntimeError("box_carry_task enabled but no box actor was created")
+        task = self.cfg.box_carry_task
+        roles = self.cfg.semantic_keyframes
+        if roles is None:
+            raise ValueError("box_carry_task.enabled requires semantic_keyframes mapping")
+        self.semantic_role_frames, self.semantic_role_times = resolve_semantic_keyframes(
+            self.motions.event_names,
+            self.motions.event_trigger_frames,
+            dict(roles),
+            self.motions.fps,
+        )
+        for role in SEMANTIC_ROLE_ORDER:
+            print(
+                f"[BoxCarrySemantic] {role} -> {roles[role]} -> frame "
+                f"{self.semantic_role_frames[role]} -> time {self.semantic_role_times[role]:.3f}s"
+            )
+        for field in ("box_distance_range", "carry_distance_range"):
+            bounds = getattr(task, field)
+            if len(bounds) != 2 or float(bounds[0]) > float(bounds[1]):
+                raise ValueError(f"box_carry_task.{field} must be an ordered [min, max] range")
+        self.box_half_extent = torch.tensor(self.box_size, device=self.device, dtype=torch.float) * 0.5
+        body_names = self.gym.get_actor_rigid_body_names(self.envs[0], self.actor_handles[0])
+        hand_names = [str(task.left_hand_body_name), str(task.right_hand_body_name)]
+        missing_hands = [name for name in hand_names if name not in body_names]
+        if missing_hands:
+            raise ValueError(f"Box carry hand bodies not found: {missing_hands}; available: {body_names}")
+        self.box_hand_indices = torch.tensor(
+            [self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name) for name in hand_names],
+            dtype=torch.long, device=self.device,
+        )
+        contact_offset = getattr(task, "hand_contact_offset", [0.055, 0.0, 0.0])
+        if len(contact_offset) != 3:
+            raise ValueError(f"box_carry_task.hand_contact_offset must be [x, y, z], got {contact_offset}")
+        self.box_hand_contact_offset = torch.tensor(contact_offset, dtype=torch.float, device=self.device)
+        self.box_hand_side_signs = torch.tensor([1.0, -1.0], dtype=torch.float, device=self.device)
+        n = self.num_envs
+        self.command_box_distance = torch.zeros(n, device=self.device)
+        self.command_carry_distance = torch.zeros(n, device=self.device)
+        self.delta_box = torch.zeros(n, device=self.device)
+        self.delta_carry = torch.zeros(n, device=self.device)
+        self.box_initial_pos = torch.zeros(n, 3, device=self.device)
+        self.box_goal_pos = torch.zeros(n, 3, device=self.device)
+        self.box_reset_heading_quat = torch.zeros(n, 4, device=self.device)
+        self.box_reset_heading_quat[:, 3] = 1.0
+        self.box_ground_z = torch.zeros(n, device=self.device)
+        self.box_prev_goal_distance = torch.zeros(n, device=self.device)
+        self.box_goal_progress = torch.zeros(n, device=self.device)
+        self.left_hand_box_distance = torch.zeros(n, device=self.device)
+        self.right_hand_box_distance = torch.zeros(n, device=self.device)
+        self.left_hand_box_penetration = torch.zeros(n, device=self.device)
+        self.right_hand_box_penetration = torch.zeros(n, device=self.device)
+        self.box_hand_contact_side = torch.zeros(n, 2, device=self.device)
+        self.box_tilt = torch.zeros(n, device=self.device)
+        self.contact_proxy = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.has_contacted = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.has_lifted = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.has_arrived = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.has_placed = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.has_released = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.box_dropped = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.box_contact_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_lift_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_arrive_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_place_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_release_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_drop_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+
+    def _sample_box_carry_range(self, bounds, count):
+        # AdaMimic's Isaac Gym helper accepts a two-dimensional shape only.
+        # Commands are scalar per environment, so sample [N, 1] then remove
+        # the singleton feature axis.
+        return torch_rand_float(
+            float(bounds[0]), float(bounds[1]), (count, 1), device=self.device
+        ).squeeze(1)
+
+    def _reset_box_carry_task(self, env_ids):
+        """Sample commands and reset only the requested dynamic boxes."""
+        task = self.cfg.box_carry_task
+        count = len(env_ids)
+        box_distance = self._sample_box_carry_range(task.box_distance_range, count)
+        carry_distance = self._sample_box_carry_range(task.carry_distance_range, count)
+        heading_quat = self.root_states[env_ids, 3:7].clone()
+        local_offset = torch.zeros(count, 3, device=self.device)
+        local_offset[:, 0] = box_distance
+        local_offset[:, 1] = float(getattr(task, "demo_lateral_offset", 0.0))
+        initial_pos = self.root_states[env_ids, :3] + quat_apply_yaw(heading_quat, local_offset)
+        ground_z = self.env_origins[env_ids, 2]
+        initial_pos[:, 2] = ground_z + self.box_half_extent[2]
+        forward_local = torch.zeros(count, 3, device=self.device)
+        forward_local[:, 0] = carry_distance
+        goal_pos = initial_pos + quat_apply_yaw(heading_quat, forward_local)
+        goal_pos[:, 2] = initial_pos[:, 2]
+
+        self.command_box_distance[env_ids] = box_distance
+        self.command_carry_distance[env_ids] = carry_distance
+        self.delta_box[env_ids] = box_distance - float(task.demo_box_distance)
+        self.delta_carry[env_ids] = carry_distance - float(task.demo_carry_distance)
+        self.box_initial_pos[env_ids] = initial_pos
+        self.box_goal_pos[env_ids] = goal_pos
+        self.box_reset_heading_quat[env_ids] = heading_quat
+        self.box_ground_z[env_ids] = ground_z
+        self.box_root_states[env_ids, :3] = initial_pos
+        self.box_root_states[env_ids, 3:7] = 0.0
+        yaw = float(getattr(self.box_cfg, "initial_yaw", 0.0))
+        self.box_root_states[env_ids, 5] = torch.sin(torch.full((count,), yaw * 0.5, device=self.device))
+        self.box_root_states[env_ids, 6] = torch.cos(torch.full((count,), yaw * 0.5, device=self.device))
+        self.box_root_states[env_ids, 7:13] = 0.0
+        self.box_prev_goal_distance[env_ids] = torch.linalg.vector_norm(goal_pos[:, :2] - initial_pos[:, :2], dim=1)
+        self.box_goal_progress[env_ids] = 0.0
+        for state in (self.contact_proxy, self.has_contacted, self.has_lifted, self.has_arrived,
+                      self.has_placed, self.has_released, self.box_dropped):
+            state[env_ids] = False
+        for counter in (self.box_contact_steps, self.box_lift_steps, self.box_arrive_steps,
+                        self.box_place_steps, self.box_release_steps, self.box_drop_steps):
+            counter[env_ids] = 0
+        self.apply_box_carry_keyframe_offsets(env_ids)
+
+    def apply_box_carry_keyframe_offsets(self, env_ids=None):
+        """Edit only current sparse-global base/body targets for box commands."""
+        if not self.box_carry_enabled:
+            return
+        ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
+        scalar = smooth_box_carry_offset(
+            self.motion_time[ids], self.semantic_role_times,
+            self.delta_box[ids], self.delta_carry[ids],
+        )
+        local = torch.zeros(len(ids), 3, device=self.device)
+        local[:, 0] = scalar
+        world_offset = quat_apply_yaw(self.box_reset_heading_quat[ids], local)
+        # In-place edits keep motion_base_pos/motion_body_pos aliases current.
+        # DoF, local rotations and the body-base local target are untouched.
+        self.motion_dict["base_pos"][ids] += world_offset
+        self.motion_dict["body_pos"][ids] += world_offset[:, None, :]
+
+    def _box_carry_observation(self):
+        if not self.box_carry_enabled:
+            return torch.empty(self.num_envs, 0, device=self.device)
+        rel_pos = quat_rotate_inverse(self.base_quat, self.box_pos - self.base_pos)
+        rel_vel = quat_rotate_inverse(self.base_quat, self.box_lin_vel)
+        height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
+        scale = max(float(self.cfg.box_carry_task.command_normalization), 1e-6)
+        return torch.cat((
+            (self.delta_box / scale)[:, None], (self.delta_carry / scale)[:, None],
+            rel_pos, rel_vel, height[:, None],
+        ), dim=1)
+
+    def _box_hand_contact_points(self, hand_states):
+        hand_pos = hand_states[:, :, :3]
+        hand_quat = hand_states[:, :, 3:7]
+        offsets = self.box_hand_contact_offset.view(1, 1, 3).expand(self.num_envs, 2, 3)
+        return hand_pos + quat_rotate(
+            hand_quat.reshape(-1, 4),
+            offsets.reshape(-1, 3),
+        ).reshape(self.num_envs, 2, 3)
+
+    def _box_side_contact_terms(self, hand_points):
+        """Distance to side contact patches and clearance violation.
+
+        Shape convention: hand_points is [num_envs, 2, 3] in world frame;
+        hand 0 targets the +Y side of the box, hand 1 targets the -Y side.
+        """
+        rel = hand_points - self.box_pos[:, None, :]
+        local = quat_rotate_inverse(
+            self.box_quat[:, None, :].expand(-1, 2, -1).reshape(-1, 4),
+            rel.reshape(-1, 3),
+        ).reshape(self.num_envs, 2, 3)
+        task = self.cfg.box_carry_task
+        # Approach should guide hands toward any feasible side surface first.
+        # Hard-coding left->+Y and right->-Y too early made the auxiliary task
+        # fight full-reference imitation when the retargeted wrist convention
+        # landed on the opposite side.  Contact can still optionally require
+        # the two hands to end up on opposite sides.
+        candidate_signs = torch.tensor([1.0, -1.0], dtype=torch.float, device=self.device)
+        side_gap_candidates = local[:, :, 1, None] * candidate_signs.view(1, 1, 2) - self.box_half_extent[1]
+        target_clearance = float(getattr(task, "contact_surface_margin", 0.035))
+        min_clearance = float(getattr(task, "min_surface_clearance", 0.015))
+        patch_margin = float(getattr(task, "contact_patch_margin", 0.04))
+        patch_half_x = torch.clamp(self.box_half_extent[0] - patch_margin, min=1e-4)
+        patch_half_z = torch.clamp(self.box_half_extent[2] - patch_margin, min=1e-4)
+        clearance_error = torch.abs(side_gap_candidates - target_clearance)
+        patch_x_error = (torch.abs(local[:, :, 0]) - patch_half_x).clamp(min=0.0)
+        patch_z_error = (torch.abs(local[:, :, 2]) - patch_half_z).clamp(min=0.0)
+        surface_distance_candidates = torch.sqrt(
+            clearance_error.square()
+            + patch_x_error[:, :, None].square()
+            + patch_z_error[:, :, None].square()
+        )
+        surface_distance, side_index = torch.min(surface_distance_candidates, dim=-1)
+        selected_side = candidate_signs[side_index]
+        inside_aabb = torch.all(torch.abs(local) < self.box_half_extent.view(1, 1, 3), dim=-1)
+        aabb_exit_depth = torch.min(self.box_half_extent.view(1, 1, 3) - torch.abs(local), dim=-1).values
+        aabb_penetration = torch.where(
+            inside_aabb,
+            aabb_exit_depth.clamp(min=0.0),
+            torch.zeros_like(aabb_exit_depth),
+        )
+        nearest_side_gap = torch.max(side_gap_candidates, dim=-1).values
+        clearance_violation = (min_clearance - nearest_side_gap).clamp(min=0.0)
+        penetration = torch.maximum(aabb_penetration, clearance_violation)
+        return surface_distance, penetration, selected_side
+
+    def _update_box_carry_state(self):
+        """Read physics state and advance one-way task flags; never write box pose."""
+        if not self.box_carry_enabled:
+            return
+        task = self.cfg.box_carry_task
+        hand_states = self.rigid_body_states[:, self.box_hand_indices, :]
+        hand_vel = hand_states[:, :, 7:10]
+        hand_points = self._box_hand_contact_points(hand_states)
+        distances, penetration, contact_side = self._box_side_contact_terms(hand_points)
+        self.left_hand_box_distance, self.right_hand_box_distance = distances[:, 0], distances[:, 1]
+        self.left_hand_box_penetration, self.right_hand_box_penetration = penetration[:, 0], penetration[:, 1]
+        self.box_hand_contact_side.copy_(contact_side)
+        hand_mean_velocity = hand_vel.mean(dim=1)
+        velocity_consistent = torch.linalg.vector_norm(hand_mean_velocity - self.box_lin_vel, dim=1) <= float(task.contact_velocity_tolerance)
+        near = torch.all(distances <= float(task.contact_distance_threshold), dim=1)
+        not_penetrating = torch.all(
+            penetration <= float(getattr(task, "contact_penetration_tolerance", 0.02)), dim=1
+        )
+        opposite_sides = (contact_side[:, 0] * contact_side[:, 1]) < 0.0
+        # Isaac Gym's exposed net force tensor has no contact-pair identity;
+        # this explicitly named proxy avoids claiming pairwise hand-box force.
+        self.contact_proxy = near & not_penetrating & velocity_consistent
+        if bool(getattr(task, "require_opposite_contact_sides", False)):
+            self.contact_proxy &= opposite_sides
+        self.box_contact_steps = torch.where(self.contact_proxy, self.box_contact_steps + 1, torch.zeros_like(self.box_contact_steps))
+        self.has_contacted |= self.box_contact_steps >= int(task.contact_hold_steps)
+
+        bottom = self.box_pos[:, 2] - self.box_half_extent[2]
+        height = bottom - self.box_ground_z
+        up = torch.zeros(self.num_envs, 3, device=self.device); up[:, 2] = 1.0
+        box_up = quat_rotate(self.box_quat, up)
+        tilt = torch.acos(box_up[:, 2].clamp(-1.0, 1.0))
+        self.box_tilt.copy_(tilt)
+        lift_candidate = self.has_contacted & self.contact_proxy & (height >= float(task.lift_threshold)) & (tilt <= float(task.max_tilt))
+        self.box_lift_steps = torch.where(lift_candidate, self.box_lift_steps + 1, torch.zeros_like(self.box_lift_steps))
+        self.has_lifted |= self.box_lift_steps >= int(task.lift_hold_steps)
+
+        goal_distance = torch.linalg.vector_norm(self.box_pos[:, :2] - self.box_goal_pos[:, :2], dim=1)
+        self.box_goal_progress = self.box_prev_goal_distance - goal_distance
+        self.box_prev_goal_distance.copy_(goal_distance)
+        arrive_candidate = self.has_lifted & (goal_distance <= float(task.goal_position_threshold))
+        self.box_arrive_steps = torch.where(arrive_candidate, self.box_arrive_steps + 1, torch.zeros_like(self.box_arrive_steps))
+        self.has_arrived |= self.box_arrive_steps >= int(task.arrive_hold_steps)
+        stable = (torch.linalg.vector_norm(self.box_lin_vel, dim=1) <= float(task.place_linear_velocity_threshold)) & (
+            torch.linalg.vector_norm(self.box_ang_vel, dim=1) <= float(task.place_angular_velocity_threshold)
+        )
+        place_candidate = self.has_arrived & (height <= float(task.place_height_threshold)) & stable
+        self.box_place_steps = torch.where(place_candidate, self.box_place_steps + 1, torch.zeros_like(self.box_place_steps))
+        self.has_placed |= self.box_place_steps >= int(task.place_hold_steps)
+        release_candidate = self.has_placed & torch.all(distances >= float(task.release_distance_threshold), dim=1) & stable
+        self.box_release_steps = torch.where(release_candidate, self.box_release_steps + 1, torch.zeros_like(self.box_release_steps))
+        self.has_released |= self.box_release_steps >= int(task.release_hold_steps)
+        dropped = self.has_lifted & (bottom < self.box_ground_z - float(task.drop_height_threshold))
+        self.box_drop_steps = torch.where(dropped, self.box_drop_steps + 1, torch.zeros_like(self.box_drop_steps))
+        self.box_dropped |= self.box_drop_steps >= int(task.drop_hold_steps)
+
+    def _box_carry_metrics(self, env_ids):
+        height = self.box_pos[env_ids, 2] - self.box_ground_z[env_ids] - self.box_half_extent[2]
+        goal_distance = torch.linalg.vector_norm(self.box_pos[env_ids, :2] - self.box_goal_pos[env_ids, :2], dim=1)
+        return {
+            "command_box_distance": self.command_box_distance[env_ids].mean(),
+            "command_carry_distance": self.command_carry_distance[env_ids].mean(),
+            "delta_box": self.delta_box[env_ids].mean(), "delta_carry": self.delta_carry[env_ids].mean(),
+            "box_height": height.mean(), "box_speed": torch.linalg.vector_norm(self.box_lin_vel[env_ids], dim=1).mean(),
+            "box_angular_speed": torch.linalg.vector_norm(self.box_ang_vel[env_ids], dim=1).mean(),
+            "box_goal_distance": goal_distance.mean(),
+            "box_tilt": self.box_tilt[env_ids].mean(),
+            "left_hand_box_distance": self.left_hand_box_distance[env_ids].mean(),
+            "right_hand_box_distance": self.right_hand_box_distance[env_ids].mean(),
+            "left_hand_box_penetration": self.left_hand_box_penetration[env_ids].mean(),
+            "right_hand_box_penetration": self.right_hand_box_penetration[env_ids].mean(),
+            "bilateral_contact_ratio": self.contact_proxy[env_ids].float().mean(),
+            "contact_success_rate": self.has_contacted[env_ids].float().mean(),
+            "lift_success_rate": self.has_lifted[env_ids].float().mean(),
+            "arrive_success_rate": self.has_arrived[env_ids].float().mean(),
+            "place_success_rate": self.has_placed[env_ids].float().mean(),
+            "full_task_success_rate": self.has_released[env_ids].float().mean(),
+            "box_drop_rate": self.box_dropped[env_ids].float().mean(),
+        }
+
+    def _reward_box_hand_approach(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        distance = 0.5 * (self.left_hand_box_distance + self.right_hand_box_distance)
+        reward = torch.exp(-distance / float(self.cfg.box_carry_task.approach_sigma))
+        return reward * (~self.has_contacted).float()
+
+    def _reward_box_hand_penetration(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        task = self.cfg.box_carry_task
+        distance = torch.stack((self.left_hand_box_distance, self.right_hand_box_distance), dim=1)
+        penetration = torch.stack((self.left_hand_box_penetration, self.right_hand_box_penetration), dim=1)
+        # Penalize actual near-contact interpenetration, not arbitrary retarget
+        # mismatch while the untrained policy is far from the object.  The
+        # previous always-on barrier was large enough to make the policy give
+        # up imitation before contact/lift rewards ever became reachable.
+        active_distance = float(getattr(task, "penetration_active_distance", 0.18))
+        max_penalty = float(getattr(task, "max_penetration_penalty", 0.05))
+        active = distance <= active_distance
+        return torch.where(active, penetration.clamp(max=max_penalty), torch.zeros_like(penetration)).mean(dim=1)
+
+    def _reward_box_contact_proxy(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        return self.contact_proxy.float()
+
+    def _reward_box_lift(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
+        return self.has_contacted.float() * torch.clamp(
+            height / float(self.cfg.box_carry_task.lift_threshold), 0.0, 1.0
+        ) * self.contact_proxy.float()
+
+    def _reward_box_transport(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        bound = float(self.cfg.box_carry_task.max_progress_per_step)
+        return self.has_lifted.float() * self.box_goal_progress.clamp(-bound, bound)
+
+    def _reward_box_place(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        goal_distance = torch.linalg.vector_norm(self.box_pos[:, :2] - self.box_goal_pos[:, :2], dim=1)
+        height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
+        speed = torch.linalg.vector_norm(self.box_lin_vel, dim=1) + torch.linalg.vector_norm(self.box_ang_vel, dim=1)
+        reward = torch.exp(-goal_distance / float(self.cfg.box_carry_task.place_position_sigma))
+        reward *= torch.exp(-torch.abs(height) / float(self.cfg.box_carry_task.place_height_sigma))
+        reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
+        return self.has_lifted.float() * reward
+
+    def _reward_box_release(self):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        separated = torch.minimum(self.left_hand_box_distance, self.right_hand_box_distance)
+        speed = torch.linalg.vector_norm(self.box_lin_vel, dim=1)
+        reward = torch.clamp(separated / float(self.cfg.box_carry_task.release_distance_threshold), 0.0, 1.0)
+        reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
+        return self.has_placed.float() * reward
+
 
     #------------ reward functions----------------
     def _reward_ang_vel_xy(self):
@@ -2939,6 +3413,10 @@ class LeggedRobot(BaseTask):
         r_body_pos_upper = torch.exp(-diff_body_pos_dist_upper / self.cfg.rewards.reward_tracking_sigma.teleop_upper_body_pos)
         r_body_pos_lower = torch.exp(-diff_body_pos_dist_lower / self.cfg.rewards.reward_tracking_sigma.teleop_lower_body_pos)
         r_body_pos = r_body_pos_lower * self.cfg.rewards.teleop_body_pos_lowerbody_weight + r_body_pos_upper * self.cfg.rewards.teleop_body_pos_upperbody_weight
+        # Keep exponential similarities strictly positive at keyframes.  This
+        # only replaces IEEE underflow (zero) by the smallest normal positive
+        # value; it does not alter representable rewards or their ordering.
+        r_body_pos = r_body_pos.clamp_min(torch.finfo(r_body_pos.dtype).tiny)
         reward = r_body_pos
 
         if self.special_scale:
@@ -3064,6 +3542,7 @@ class LeggedRobot(BaseTask):
         rotation_diff = self.dif_global_body_rot
         diff_body_rot_dist = (rotation_diff**2).mean(dim=-1)#.mean(dim=-1)
         r_body_rot = torch.exp(-diff_body_rot_dist / self.cfg.rewards.reward_tracking_sigma.teleop_body_rot)
+        r_body_rot = r_body_rot.clamp_min(torch.finfo(r_body_rot.dtype).tiny)
         reward = r_body_rot
 
         if self.special_scale:
@@ -3123,6 +3602,7 @@ class LeggedRobot(BaseTask):
         diff_trunk_height = self.body_pos[:, self.trunk_indices, 2] - self.motion_body_pos[:, self.trunk_indices, 2]
         mean_diff_trunk_height = torch.sum(coef * torch.clip(torch.abs(diff_trunk_height) - 0.02, min=0.0), dim=1)
         reward = torch.exp(-self.cfg.rewards.reward_tracking_sigma.trunk_height_sigma * torch.square(mean_diff_trunk_height))
+        reward = reward.clamp_min(torch.finfo(reward.dtype).tiny)
         if self.special_scale:
             special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:
@@ -3186,6 +3666,7 @@ class LeggedRobot(BaseTask):
         feet_diff = self.dif_global_body_pos[:, self.feet_keyframe_indices, :]
         diff_feet = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         reward = torch.exp(-diff_feet / self.cfg.rewards.reward_tracking_sigma.teleop_feet_pos)
+        reward = reward.clamp_min(torch.finfo(reward.dtype).tiny)
         if self.special_scale:
             special = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
             for index in self.cfg.dataset.special_scale_index:

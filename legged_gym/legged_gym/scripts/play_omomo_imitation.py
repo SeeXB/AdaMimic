@@ -85,18 +85,6 @@ def main(cfg):
     cfg.env.algorithm.rsi = False
     cfg.env.terrain.curriculum = False
     _upgrade_removed_legacy_omomo_dataset(cfg)
-    with open_dict(cfg):
-        # sub3_largebox_003: retain the OBJ aspect ratio but use a 0.75-scale
-        # visual proxy.  G1 is more compact than the human source skeleton.
-        # horizontal_scale is deliberately replay-only: it calibrates contact
-        # inspection without modifying the exported GMR/object reference.
-        cfg.env.visual_box = {
-            "enabled": True,
-            "size": [0.353, 0.344, 0.305],
-            "mass": 4.0,
-            "center_offset": [0.0, 0.0, 0.1525],
-            "horizontal_scale": 0.65,
-        }
     cfg = AttrDict(OmegaConf.to_container(cfg, resolve=True))
     cfg.run_dir = HydraConfig.get().runtime.output_dir
     env, env_cfg = task_registry.make_env_hydra(cfgs=cfg)
@@ -104,8 +92,6 @@ def main(cfg):
     runner.load(cfg.resume_path)
     policy = runner.get_inference_policy(device=env.device)
     obs, _ = env.reset()
-    left_hand = env.gym.find_actor_rigid_body_handle(env.envs[0], env.actor_handles[0], "left_wrist_yaw_link")
-    right_hand = env.gym.find_actor_rigid_body_handle(env.envs[0], env.actor_handles[0], "right_wrist_yaw_link")
     # The generic terrain camera can point away from a single reset robot.
     # Re-anchor it to the robot before the first rendered control step.
     root = env.root_states[0, :3].detach().cpu().numpy()
@@ -119,14 +105,19 @@ def main(cfg):
             actions = policy(obs)
             obs, _, _, _, dones, infos, _, _ = env.step(actions)
         event_id = int(env.motion_event_id[0].item())
-        if step % 10 == 0 and getattr(env, "visual_box_enabled", False):
+        if step % 10 == 0 and getattr(env, "box_enabled", False):
             box_pos = env.box_rigid_body_states[0, :3]
-            hand_pos = env.rigid_body_states[0, [left_hand, right_hand], :3]
-            hand_dist = torch.linalg.vector_norm(hand_pos - box_pos, dim=1)
-            print(
-                f"  box_z={box_pos[2].item():.3f}m, "
-                f"hand_dist=[{hand_dist[0].item():.3f}, {hand_dist[1].item():.3f}]m"
-            )
+            if getattr(env, "box_carry_enabled", False):
+                print(
+                    f"  box_z={box_pos[2].item():.3f}m, "
+                    f"surface_dist=[{env.left_hand_box_distance[0].item():.3f}, "
+                    f"{env.right_hand_box_distance[0].item():.3f}]m, "
+                    f"penetration=[{env.left_hand_box_penetration[0].item():.3f}, "
+                    f"{env.right_hand_box_penetration[0].item():.3f}]m, "
+                    f"contact_proxy={bool(env.contact_proxy[0])}"
+                )
+            else:
+                print(f"  box_z={box_pos[2].item():.3f}m")
         if event_id != previous_event:
             label = "non-keyframe" if event_id < 0 else env.motions.event_names[event_id]
             print(f"step={step:03d}, motion_time={env.motion_time[0].item():.3f}s, phase={label}")

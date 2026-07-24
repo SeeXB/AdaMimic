@@ -111,7 +111,7 @@ algo:
     policy_class_name: 'TrackActorCritic'
     algorithm_class_name: 'TrackPPO'
     num_steps_per_env: 75 # per iteration
-    max_iterations: 40000 # number of policy updates
+    max_iterations: 4000 # number of policy updates
     train_high: false
 
     # logging

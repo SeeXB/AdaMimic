@@ -139,3 +139,12 @@ reference_mode:
 phase_control:
   mode: learned
   fixed_dt_scale: 1.0
+
+# Disabled compatibility defaults.  The box-carry datasets override these;
+# existing robot-only tracking configurations remain bit-for-bit unchanged.
+object_interaction:
+  enabled: false
+box_carry_task:
+  enabled: false
+semantic_keyframes: null
+box_carry_observation: null

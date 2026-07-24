@@ -357,6 +357,18 @@ class TrackOnPolicyRunner:
 
 
     def load_weights_without_actor_time(self, model, checkpoint):
+        # Box-carry appends nine actor features per history step.  Loading an
+        # old tracking checkpoint into that architecture must fail explicitly;
+        # silently truncating/padding would hide a changed policy interface.
+        actor_weight = checkpoint.get('actor.0.weight')
+        expected_actor_weight = model.state_dict().get('actor.0.weight')
+        if actor_weight is not None and expected_actor_weight is not None and actor_weight.shape != expected_actor_weight.shape:
+            raise RuntimeError(
+                "Checkpoint actor observation shape is incompatible with this task: "
+                f"checkpoint actor.0.weight={tuple(actor_weight.shape)}, "
+                f"current={tuple(expected_actor_weight.shape)}. "
+                "Train the box-carry configuration from scratch; no implicit observation migration is performed."
+            )
         # 加载整个检查点
         checkpoint = checkpoint
         

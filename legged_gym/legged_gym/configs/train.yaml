@@ -2,7 +2,7 @@ headless: true
 sim_device: 'cuda:0'
 num_envs: 4096
 rl_device: 'cuda:0'
-base: ../..
+base: ${oc.env:ADAMIMIC_ROOT,.}
 run_name: test
 task: ${algorithm.task}
 task_id: ${dataset.task_id}
@@ -139,6 +139,10 @@ env:
   dataset: ${dataset.dataset}
   reference_mode: ${dataset.reference_mode}
   phase_control: ${dataset.phase_control}
+  object_interaction: ${dataset.object_interaction}
+  box_carry_task: ${dataset.box_carry_task}
+  semantic_keyframes: ${dataset.semantic_keyframes}
+  box_carry_observation: ${dataset.box_carry_observation}
 
   termination_curriculum: ${algorithm.termination_curriculum}
   algorithm: ${algorithm.algorithm}
@@ -149,4 +153,4 @@ checkpoint_path: null
 
 hydra:
   run:
-    dir: ../exp/${robot.name}/${task_id}/${algorithm.algo_name}/${now:%Y%m%d_%H%M%S}_${robot.name}_${task_id}_${algorithm.algo_name}_${run_name}
+    dir: ${base}/exp/${robot.name}/${task_id}/${algorithm.algo_name}/${now:%Y%m%d_%H%M%S}_${robot.name}_${task_id}_${algorithm.algo_name}_${run_name}
