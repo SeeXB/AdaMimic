@@ -290,6 +290,14 @@ def _hand_push(config: Any, motion_path: Path, sim_device: str, steps: int, forc
     right_idx = gym.get_actor_rigid_body_index(env, robot_actor, gym.find_actor_rigid_body_handle(env, robot_actor, right_name), gymapi.DOMAIN_SIM)
     box_body_idx = gym.get_actor_rigid_body_index(env, box_actor, 0, gymapi.DOMAIN_SIM)
     box_actor_idx = gym.get_actor_index(env, box_actor, gymapi.DOMAIN_SIM)
+    # Tensor views returned by Isaac Gym are not guaranteed to contain the
+    # actor poses set before prepare_sim until they are refreshed.  Reading the
+    # initial box pose without this refresh makes the displacement check compare
+    # against stale/zero memory, which looks like a >1m "push" even when the box
+    # barely moved.
+    gym.refresh_actor_root_state_tensor(sim)
+    gym.refresh_rigid_body_state_tensor(sim)
+    gym.refresh_net_contact_force_tensor(sim)
     initial_box_pos = root_tensor[box_actor_idx, :3].clone()
 
     max_box_contact_force = 0.0

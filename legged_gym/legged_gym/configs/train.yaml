@@ -145,7 +145,20 @@ env:
   box_carry_observation: ${dataset.box_carry_observation}
 
   termination_curriculum: ${algorithm.termination_curriculum}
-  algorithm: ${algorithm.algorithm}
+  algorithm:
+    infer_keyframe_time: ${algorithm.algorithm.infer_keyframe_time}
+    apply_reward_scale: ${algorithm.algorithm.apply_reward_scale}
+    sparse_global: ${algorithm.algorithm.sparse_global}
+    sparse_local: ${algorithm.algorithm.sparse_local}
+    special_scale: ${algorithm.algorithm.special_scale}
+    special_scale_size: ${algorithm.algorithm.special_scale_size}
+    reverse_term_curriculum: ${algorithm.algorithm.reverse_term_curriculum}
+    reverse_term_curriculum_iter: ${algorithm.algorithm.reverse_term_curriculum_iter}
+    rsi: ${oc.select:dataset.algorithm.rsi,${algorithm.algorithm.rsi}}
+    no_sparse: ${algorithm.algorithm.no_sparse}
+    amp: ${algorithm.algorithm.amp}
+    no_dense: ${algorithm.algorithm.no_dense}
+    no_aug: ${algorithm.algorithm.no_aug}
   amp: ${algorithm.algo.amp}
 
 algo: ${algorithm.algo}

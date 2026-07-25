@@ -150,12 +150,11 @@ class LeggedRobot(BaseTask):
         self.phase_control_mode = str(getattr(getattr(self.cfg, "phase_control", {}), "mode", "learned"))
         self.fixed_dt_scale = float(getattr(getattr(self.cfg, "phase_control", {}), "fixed_dt_scale", 1.0))
         box_carry_task_cfg = getattr(self.cfg, "box_carry_task", None)
-        if bool(getattr(box_carry_task_cfg, "enabled", False)) and bool(getattr(self.cfg.algorithm, "rsi", False)):
-            print(
-                "[BoxCarryRSI] Forcing algorithm.rsi=false for Box-Carry stage-1. "
-                "Phase-consistent RSI is future work."
+        if bool(getattr(box_carry_task_cfg, "enabled", False)):
+            assert not bool(getattr(self.cfg.algorithm, "rsi", False)), (
+                "box_carry_task.enabled requires cfg.algorithm.rsi=false. "
+                "Box-Carry stage-1 does not support phase-consistent RSI yet."
             )
-            self.cfg.algorithm.rsi = False
         self._validate_reference_mode_config()
         self._init_buffers()
         self._prepare_reward_function()
@@ -687,7 +686,7 @@ class LeggedRobot(BaseTask):
         # print(self.motion_time)
         if self.cfg.termination.dof_termination:
             self.termination_dof_deviation_buf = (
-                (self.motion_dof_pos - self.dof_pos).max(dim=-1)[0]
+                torch.abs(self.motion_dof_pos - self.dof_pos).max(dim=-1)[0]
                 > (self.cfg.termination_curriculum.terminate_when_motion_far_threshold_max / 2)
             )
             self.reset_buf |= self.termination_dof_deviation_buf
@@ -3035,7 +3034,18 @@ class LeggedRobot(BaseTask):
             [left_contact_offset, right_contact_offset],
             dtype=torch.float, device=self.device,
         )
-        self.box_hand_side_signs = torch.tensor([1.0, -1.0], dtype=torch.float, device=self.device)
+        hand_side_signs = getattr(task, "hand_contact_side_signs", [1.0, -1.0])
+        if len(hand_side_signs) != 2:
+            raise ValueError(
+                f"box_carry_task.hand_contact_side_signs must be [left, right], got {hand_side_signs}"
+            )
+        side_values = [float(sign) for sign in hand_side_signs]
+        if any(abs(abs(sign) - 1.0) > 1e-6 for sign in side_values):
+            raise ValueError(
+                "box_carry_task.hand_contact_side_signs values must be -1 or +1 "
+                f"for the box local Y side, got {hand_side_signs}"
+            )
+        self.box_hand_side_signs = torch.tensor(side_values, dtype=torch.float, device=self.device)
         n = self.num_envs
         self.command_box_distance = torch.zeros(n, device=self.device)
         self.command_carry_distance = torch.zeros(n, device=self.device)
@@ -3055,18 +3065,27 @@ class LeggedRobot(BaseTask):
         self.box_hand_contact_side = torch.zeros(n, 2, device=self.device)
         self.box_tilt = torch.zeros(n, device=self.device)
         self.contact_proxy = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.grasp_contact_with_grace = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.valid_transport = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.has_contacted = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.has_lifted = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.has_arrived = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.has_placed = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.has_released = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.box_dropped = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.box_full_task_success = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.box_max_height_after_lift = torch.zeros(n, device=self.device)
+        self.box_current_goal_distance = torch.zeros(n, device=self.device)
         self.box_contact_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_grasp_grace_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self.box_lift_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self.box_arrive_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self.box_place_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self.box_release_steps = torch.zeros(n, dtype=torch.long, device=self.device)
         self.box_drop_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_drop_events = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_transport_without_contact_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.box_transport_progress_steps = torch.zeros(n, dtype=torch.long, device=self.device)
 
     def _sample_box_carry_range(self, bounds, count):
         # AdaMimic's Isaac Gym helper accepts a two-dimensional shape only.
@@ -3110,11 +3129,17 @@ class LeggedRobot(BaseTask):
         self.box_root_states[env_ids, 7:13] = 0.0
         self.box_prev_goal_distance[env_ids] = torch.linalg.vector_norm(goal_pos[:, :2] - initial_pos[:, :2], dim=1)
         self.box_goal_progress[env_ids] = 0.0
-        for state in (self.contact_proxy, self.has_contacted, self.has_lifted, self.has_arrived,
-                      self.has_placed, self.has_released, self.box_dropped):
+        for state in (self.contact_proxy, self.grasp_contact_with_grace, self.valid_transport,
+                      self.has_contacted, self.has_lifted, self.has_arrived,
+                      self.has_placed, self.has_released, self.box_dropped,
+                      self.box_full_task_success):
             state[env_ids] = False
-        for counter in (self.box_contact_steps, self.box_lift_steps, self.box_arrive_steps,
-                        self.box_place_steps, self.box_release_steps, self.box_drop_steps):
+        self.box_max_height_after_lift[env_ids] = 0.0
+        self.box_current_goal_distance[env_ids] = self.box_prev_goal_distance[env_ids]
+        for counter in (self.box_contact_steps, self.box_grasp_grace_steps, self.box_lift_steps,
+                        self.box_arrive_steps, self.box_place_steps, self.box_release_steps,
+                        self.box_drop_steps, self.box_drop_events,
+                        self.box_transport_without_contact_steps, self.box_transport_progress_steps):
             counter[env_ids] = 0
         self.apply_box_carry_keyframe_offsets(env_ids)
 
@@ -3201,6 +3226,43 @@ class LeggedRobot(BaseTask):
         penetration = torch.maximum(aabb_penetration, clearance_violation)
         return surface_distance, penetration, selected_side
 
+    def _box_motion_phase_name(self, env_id):
+        time_s = float(self.motion_time[env_id].item())
+        for start_role, end_role in zip(SEMANTIC_ROLE_ORDER[:-1], SEMANTIC_ROLE_ORDER[1:]):
+            start = float(self.semantic_role_times[start_role])
+            end = float(self.semantic_role_times[end_role])
+            if start <= time_s < end:
+                return f"{start_role}->{end_role}"
+        if time_s < float(self.semantic_role_times[SEMANTIC_ROLE_ORDER[0]]):
+            return f"before_{SEMANTIC_ROLE_ORDER[0]}"
+        return f"after_{SEMANTIC_ROLE_ORDER[-1]}"
+
+    def _log_box_state_transition(self, state_name, transitioned, box_height):
+        if not bool(transitioned.any().item()):
+            return
+        env_ids = transitioned.nonzero(as_tuple=False).flatten()
+        sample_env_ids = env_ids[:8]
+        sample_rows = []
+        for env_id in sample_env_ids.detach().cpu().tolist():
+            sample_rows.append({
+                "env": int(env_id),
+                "motion_phase": self._box_motion_phase_name(env_id),
+                "box_position": [float(x) for x in self.box_pos[env_id].detach().cpu().tolist()],
+                "box_height": float(box_height[env_id].detach().cpu().item()),
+            })
+        print(
+            f"[BoxCarryTransition] old_state={state_name}:false new_state={state_name}:true "
+            f"count={int(env_ids.numel())} samples={sample_rows}"
+        )
+
+    def _advance_latched_box_state(self, state_name, state_buf, counter_buf, candidate, hold_steps, box_height):
+        candidate = candidate & ~state_buf
+        counter_buf[:] = torch.where(candidate, counter_buf + 1, torch.zeros_like(counter_buf))
+        transitioned = (~state_buf) & (counter_buf >= int(hold_steps))
+        self._log_box_state_transition(state_name, transitioned, box_height)
+        state_buf[:] |= transitioned
+        return transitioned
+
     def _update_box_carry_state(self):
         """Read physics state and advance one-way task flags; never write box pose."""
         if not self.box_carry_enabled:
@@ -3225,8 +3287,6 @@ class LeggedRobot(BaseTask):
         self.contact_proxy = near & not_penetrating & velocity_consistent
         if bool(getattr(task, "require_opposite_contact_sides", False)):
             self.contact_proxy &= opposite_sides
-        self.box_contact_steps = torch.where(self.contact_proxy, self.box_contact_steps + 1, torch.zeros_like(self.box_contact_steps))
-        self.has_contacted |= self.box_contact_steps >= int(task.contact_hold_steps)
 
         bottom = self.box_pos[:, 2] - self.box_half_extent[2]
         height = bottom - self.box_ground_z
@@ -3234,32 +3294,126 @@ class LeggedRobot(BaseTask):
         box_up = quat_rotate(self.box_quat, up)
         tilt = torch.acos(box_up[:, 2].clamp(-1.0, 1.0))
         self.box_tilt.copy_(tilt)
-        lift_candidate = self.has_contacted & self.contact_proxy & (height >= float(task.lift_threshold)) & (tilt <= float(task.max_tilt))
-        self.box_lift_steps = torch.where(lift_candidate, self.box_lift_steps + 1, torch.zeros_like(self.box_lift_steps))
-        self.has_lifted |= self.box_lift_steps >= int(task.lift_hold_steps)
 
         goal_distance = torch.linalg.vector_norm(self.box_pos[:, :2] - self.box_goal_pos[:, :2], dim=1)
+        self.box_current_goal_distance.copy_(goal_distance)
         self.box_goal_progress = self.box_prev_goal_distance - goal_distance
         self.box_prev_goal_distance.copy_(goal_distance)
-        arrive_candidate = self.has_lifted & (goal_distance <= float(task.goal_position_threshold))
-        self.box_arrive_steps = torch.where(arrive_candidate, self.box_arrive_steps + 1, torch.zeros_like(self.box_arrive_steps))
-        self.has_arrived |= self.box_arrive_steps >= int(task.arrive_hold_steps)
-        stable = (torch.linalg.vector_norm(self.box_lin_vel, dim=1) <= float(task.place_linear_velocity_threshold)) & (
-            torch.linalg.vector_norm(self.box_ang_vel, dim=1) <= float(task.place_angular_velocity_threshold)
+
+        phase_approach_contact = self._box_phase_mask("approach", "contact")
+        phase_contact_lift = self._box_phase_mask("contact", "lift")
+        phase_lift_arrive = self._box_phase_mask("lift", "arrive")
+        phase_arrive_place = self._box_phase_mask("arrive", "place")
+        phase_place_release = self._box_phase_mask("place", "release")
+
+        contact_grace_steps = int(getattr(task, "contact_grace_steps", task.contact_hold_steps))
+        self.box_grasp_grace_steps[:] = torch.where(
+            self.contact_proxy,
+            torch.full_like(self.box_grasp_grace_steps, contact_grace_steps),
+            (self.box_grasp_grace_steps - 1).clamp(min=0),
         )
-        place_candidate = self.has_arrived & (height <= float(task.place_height_threshold)) & stable
-        self.box_place_steps = torch.where(place_candidate, self.box_place_steps + 1, torch.zeros_like(self.box_place_steps))
-        self.has_placed |= self.box_place_steps >= int(task.place_hold_steps)
-        release_candidate = self.has_placed & torch.all(distances >= float(task.release_distance_threshold), dim=1) & stable
-        self.box_release_steps = torch.where(release_candidate, self.box_release_steps + 1, torch.zeros_like(self.box_release_steps))
-        self.has_released |= self.box_release_steps >= int(task.release_hold_steps)
-        dropped = self.has_lifted & (bottom < self.box_ground_z - float(task.drop_height_threshold))
-        self.box_drop_steps = torch.where(dropped, self.box_drop_steps + 1, torch.zeros_like(self.box_drop_steps))
-        self.box_dropped |= self.box_drop_steps >= int(task.drop_hold_steps)
+        self.grasp_contact_with_grace[:] = self.contact_proxy | (self.box_grasp_grace_steps > 0)
+
+        contact_candidate = self.contact_proxy & phase_approach_contact & ~self.has_contacted
+        self._advance_latched_box_state(
+            "has_contacted", self.has_contacted, self.box_contact_steps,
+            contact_candidate, int(task.contact_hold_steps), height,
+        )
+
+        lift_candidate = (
+            self.has_contacted
+            & self.contact_proxy
+            & (height >= float(task.lift_threshold))
+            & (tilt <= float(task.max_tilt))
+            & phase_contact_lift
+            & ~self.has_lifted
+        )
+        self._advance_latched_box_state(
+            "has_lifted", self.has_lifted, self.box_lift_steps,
+            lift_candidate, int(task.lift_hold_steps), height,
+        )
+        self.box_max_height_after_lift[:] = torch.where(
+            self.has_lifted,
+            torch.maximum(self.box_max_height_after_lift, height),
+            self.box_max_height_after_lift,
+        )
+
+        arrive_candidate = (
+            self.has_lifted
+            & (goal_distance <= float(task.goal_position_threshold))
+            & phase_lift_arrive
+            & ~self.has_arrived
+        )
+        self._advance_latched_box_state(
+            "has_arrived", self.has_arrived, self.box_arrive_steps,
+            arrive_candidate, int(task.arrive_hold_steps), height,
+        )
+
+        linear_stable = torch.linalg.vector_norm(self.box_lin_vel, dim=1) <= float(task.place_linear_velocity_threshold)
+        angular_stable = torch.linalg.vector_norm(self.box_ang_vel, dim=1) <= float(task.place_angular_velocity_threshold)
+        stable = linear_stable & angular_stable
+        current_goal_valid = goal_distance <= float(task.goal_position_threshold)
+        current_ground_valid = torch.abs(height) <= float(task.place_height_threshold)
+        current_tilt_valid = tilt <= float(getattr(task, "place_tilt_threshold", task.max_tilt))
+        place_current_valid = current_goal_valid & current_ground_valid & stable & current_tilt_valid
+        place_candidate = (
+            self.has_arrived
+            & place_current_valid
+            & phase_arrive_place
+            & ~self.has_placed
+        )
+        self._advance_latched_box_state(
+            "has_placed", self.has_placed, self.box_place_steps,
+            place_candidate, int(task.place_hold_steps), height,
+        )
+
+        hands_separated = torch.all(distances >= float(task.release_distance_threshold), dim=1)
+        release_current_valid = place_current_valid & hands_separated
+        release_candidate = (
+            self.has_placed
+            & release_current_valid
+            & phase_place_release
+            & ~self.has_released
+        )
+        self._advance_latched_box_state(
+            "has_released", self.has_released, self.box_release_steps,
+            release_candidate, int(task.release_hold_steps), height,
+        )
+        self.box_full_task_success[:] = self.has_released & release_current_valid
+
+        minimum_transport_height = float(getattr(task, "minimum_transport_height", task.lift_threshold))
+        max_transport_tilt = float(getattr(task, "max_transport_tilt", task.max_tilt))
+        self.valid_transport[:] = (
+            self.has_lifted
+            & ~self.box_dropped
+            & self.grasp_contact_with_grace
+            & (height > minimum_transport_height)
+            & (tilt < max_transport_tilt)
+            & phase_lift_arrive
+        )
+        transport_progress_step = self.has_lifted & phase_lift_arrive & (self.box_goal_progress > 0.0)
+        self.box_transport_progress_steps += transport_progress_step.long()
+        self.box_transport_without_contact_steps += (
+            transport_progress_step & ~self.grasp_contact_with_grace
+        ).long()
+
+        dropped_candidate = (
+            self.has_lifted
+            & ~self.has_placed
+            & ~self.grasp_contact_with_grace
+            & (height < float(task.drop_height_threshold))
+            & (self.box_max_height_after_lift >= float(task.lift_threshold))
+        )
+        drop_transition = self._advance_latched_box_state(
+            "box_dropped", self.box_dropped, self.box_drop_steps,
+            dropped_candidate, int(task.drop_hold_steps), height,
+        )
+        self.box_drop_events += drop_transition.long()
 
     def _box_carry_metrics(self, env_ids):
         height = self.box_pos[env_ids, 2] - self.box_ground_z[env_ids] - self.box_half_extent[2]
         goal_distance = torch.linalg.vector_norm(self.box_pos[env_ids, :2] - self.box_goal_pos[env_ids, :2], dim=1)
+        transport_denominator = self.box_transport_progress_steps[env_ids].float().clamp_min(1.0)
         return {
             "command_box_distance": self.command_box_distance[env_ids].mean(),
             "command_carry_distance": self.command_carry_distance[env_ids].mean(),
@@ -3277,8 +3431,14 @@ class LeggedRobot(BaseTask):
             "lift_success_rate": self.has_lifted[env_ids].float().mean(),
             "arrive_success_rate": self.has_arrived[env_ids].float().mean(),
             "place_success_rate": self.has_placed[env_ids].float().mean(),
-            "full_task_success_rate": self.has_released[env_ids].float().mean(),
+            "release_success_rate": self.has_released[env_ids].float().mean(),
+            "full_task_success_rate": self.box_full_task_success[env_ids].float().mean(),
             "box_drop_rate": self.box_dropped[env_ids].float().mean(),
+            "box_drop_events": self.box_drop_events[env_ids].float().mean(),
+            "valid_transport_ratio": self.valid_transport[env_ids].float().mean(),
+            "transport_without_contact_ratio": (
+                self.box_transport_without_contact_steps[env_ids].float() / transport_denominator
+            ).mean(),
         }
 
     def _reward_box_hand_approach(self):
@@ -3312,28 +3472,57 @@ class LeggedRobot(BaseTask):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
         bound = float(self.cfg.box_carry_task.max_progress_per_step)
-        reward = self.has_lifted.float() * self.box_goal_progress.clamp(-bound, bound)
+        reward = self.valid_transport.float() * self.box_goal_progress.clamp(-bound, bound)
         return reward * self._box_phase_mask("lift", "arrive").float()
 
     def _reward_box_place(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
+        task = self.cfg.box_carry_task
         goal_distance = torch.linalg.vector_norm(self.box_pos[:, :2] - self.box_goal_pos[:, :2], dim=1)
         height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
         speed = torch.linalg.vector_norm(self.box_lin_vel, dim=1) + torch.linalg.vector_norm(self.box_ang_vel, dim=1)
-        reward = torch.exp(-goal_distance / float(self.cfg.box_carry_task.place_position_sigma))
-        reward *= torch.exp(-torch.abs(height) / float(self.cfg.box_carry_task.place_height_sigma))
-        reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
-        return self.has_lifted.float() * reward * self._box_phase_mask("arrive", "place").float()
+        reward = torch.exp(-goal_distance / float(task.place_position_sigma))
+        reward *= torch.exp(-torch.abs(height) / float(task.place_height_sigma))
+        reward *= torch.exp(-speed / float(task.place_velocity_sigma))
+        current_place_valid = (
+            (goal_distance <= float(task.goal_position_threshold))
+            & (torch.abs(height) <= float(task.place_height_threshold))
+            & (torch.linalg.vector_norm(self.box_lin_vel, dim=1) <= float(task.place_linear_velocity_threshold))
+            & (torch.linalg.vector_norm(self.box_ang_vel, dim=1) <= float(task.place_angular_velocity_threshold))
+            & (self.box_tilt <= float(getattr(task, "place_tilt_threshold", task.max_tilt)))
+        )
+        return (
+            self.has_arrived.float()
+            * (~self.box_dropped).float()
+            * current_place_valid.float()
+            * reward
+            * self._box_phase_mask("arrive", "place").float()
+        )
 
     def _reward_box_release(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
+        task = self.cfg.box_carry_task
+        goal_distance = torch.linalg.vector_norm(self.box_pos[:, :2] - self.box_goal_pos[:, :2], dim=1)
+        height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
         separated = torch.minimum(self.left_hand_box_distance, self.right_hand_box_distance)
         speed = torch.linalg.vector_norm(self.box_lin_vel, dim=1)
-        reward = torch.clamp(separated / float(self.cfg.box_carry_task.release_distance_threshold), 0.0, 1.0)
-        reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
-        return self.has_placed.float() * reward * self._box_phase_mask("place", "release").float()
+        reward = torch.clamp(separated / float(task.release_distance_threshold), 0.0, 1.0)
+        reward *= torch.exp(-speed / float(task.place_velocity_sigma))
+        current_release_valid = (
+            (goal_distance <= float(task.goal_position_threshold))
+            & (torch.abs(height) <= float(task.place_height_threshold))
+            & (torch.linalg.vector_norm(self.box_lin_vel, dim=1) <= float(task.place_linear_velocity_threshold))
+            & (torch.linalg.vector_norm(self.box_ang_vel, dim=1) <= float(task.place_angular_velocity_threshold))
+            & (self.box_tilt <= float(getattr(task, "place_tilt_threshold", task.max_tilt)))
+        )
+        return (
+            self.has_placed.float()
+            * current_release_valid.float()
+            * reward
+            * self._box_phase_mask("place", "release").float()
+        )
 
 
     #------------ reward functions----------------
