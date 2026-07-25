@@ -3189,10 +3189,12 @@ class LeggedRobot(BaseTask):
         ).reshape(self.num_envs, 2, 3)
 
     def _box_side_contact_terms(self, hand_points):
-        """Distance to side contact patches and clearance violation.
+        """Distance to configured side contact patches and clearance violation.
 
-        Shape convention: hand_points is [num_envs, 2, 3] in world frame;
-        hand 0 targets the +Y side of the box, hand 1 targets the -Y side.
+        Shape convention: hand_points is [num_envs, 2, 3] in world frame.  The
+        target side for each hand is configured by ``box_hand_side_signs`` in
+        the box-local Y axis; this is intentionally not hard-coded because the
+        G1 left/right rubber-hand frames are mirrored.
         """
         rel = hand_points - self.box_pos[:, None, :]
         local = quat_rotate_inverse(
@@ -3275,8 +3277,12 @@ class LeggedRobot(BaseTask):
         self.left_hand_box_distance, self.right_hand_box_distance = distances[:, 0], distances[:, 1]
         self.left_hand_box_penetration, self.right_hand_box_penetration = penetration[:, 0], penetration[:, 1]
         self.box_hand_contact_side.copy_(contact_side)
-        hand_mean_velocity = hand_vel.mean(dim=1)
-        velocity_consistent = torch.linalg.vector_norm(hand_mean_velocity - self.box_lin_vel, dim=1) <= float(task.contact_velocity_tolerance)
+        hand_velocity_error = torch.linalg.vector_norm(
+            hand_vel - self.box_lin_vel[:, None, :], dim=-1
+        )
+        velocity_consistent = torch.all(
+            hand_velocity_error <= float(task.contact_velocity_tolerance), dim=1
+        )
         near = torch.all(distances <= float(task.contact_distance_threshold), dim=1)
         not_penetrating = torch.all(
             penetration <= float(getattr(task, "contact_penetration_tolerance", 0.02)), dim=1
@@ -3300,7 +3306,7 @@ class LeggedRobot(BaseTask):
         self.box_goal_progress = self.box_prev_goal_distance - goal_distance
         self.box_prev_goal_distance.copy_(goal_distance)
 
-        phase_approach_contact = self._box_phase_mask("approach", "contact")
+        phase_approach_lift = self._box_phase_mask("approach", "lift")
         phase_contact_lift = self._box_phase_mask("contact", "lift")
         phase_lift_arrive = self._box_phase_mask("lift", "arrive")
         phase_arrive_place = self._box_phase_mask("arrive", "place")
@@ -3314,7 +3320,7 @@ class LeggedRobot(BaseTask):
         )
         self.grasp_contact_with_grace[:] = self.contact_proxy | (self.box_grasp_grace_steps > 0)
 
-        contact_candidate = self.contact_proxy & phase_approach_contact & ~self.has_contacted
+        contact_candidate = self.contact_proxy & phase_approach_lift & ~self.has_contacted
         self._advance_latched_box_state(
             "has_contacted", self.has_contacted, self.box_contact_steps,
             contact_candidate, int(task.contact_hold_steps), height,

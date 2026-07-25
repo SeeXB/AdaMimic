@@ -66,23 +66,22 @@ box_carry_task:
   command_normalization: 1.0
   left_hand_body_name: left_rubber_hand
   right_hand_body_name: right_rubber_hand
-  # The rubber-hand mesh extends mostly along +x and is mirrored in local y.
-  # The old [0.055, 0, 0] point is near the palm/inertial center, not a contact
-  # surface, and can sit inside the box even when the palm surface is outside.
+  # The rubber-hand meshes are mirrored in local y: left hand spans mostly
+  # negative local-y, right hand spans mostly positive local-y.  Keep the
+  # contact offsets separate; do not assume both hands share the same local
+  # contact axis.
   left_hand_contact_offset: [0.0, -0.055, 0.0]
-  right_hand_contact_offset: [0.0, -0.055, 0.0]
-  hand_contact_side_signs: [-1.0, -1.0]
+  right_hand_contact_offset: [0.0, 0.055, 0.0]
+  hand_contact_side_signs: [-1.0, 1.0]
   contact_surface_margin: 0.035
   min_surface_clearance: 0.015
   contact_patch_margin: 0.04
-  # Data-driven from validate_box_reference_geometry.py after the object COM
-  # and contact-side fixes: focused reference contact/lift/carry needs 0.399m.
-  contact_distance_threshold: 0.40
+  # This is a real-contact proxy distance, not a reference-pass threshold.
+  # validate_box_reference_geometry.py must fail if a reference needs a much
+  # larger value.
+  contact_distance_threshold: 0.10
   contact_penetration_tolerance: 0.02
-  # sub3_largebox_003 is a same-side/support-style carry reference after
-  # projection into the box frame. Requiring opposite faces makes the contact
-  # state impossible while the dense/local imitation still asks for this demo.
-  require_opposite_contact_sides: false
+  require_opposite_contact_sides: true
   contact_velocity_tolerance: 0.75
   contact_hold_steps: 3
   contact_grace_steps: 3
