@@ -143,6 +143,26 @@ class BoxStateMachineTest(unittest.TestCase):
         self.assertFalse(bool(env.has_contacted.item()))
         self.assertFalse(bool(env.has_lifted.item()))
 
+    def test_contact_window_extends_until_lift(self):
+        env = _make_env(motion_time=2.5)
+        env.test_distances[:] = 0.01
+        env._update_box_carry_state()
+        self.assertTrue(bool(env.has_contacted.item()))
+        self.assertFalse(bool(env.has_lifted.item()))
+
+    def test_contact_uses_each_hand_velocity_not_mean_velocity(self):
+        env = _make_env(motion_time=1.5, task=_make_task(contact_velocity_tolerance=0.2))
+        env.test_distances[:] = 0.01
+        # The two hand velocities average to the static box velocity.  This
+        # used to pass when the contact proxy compared only mean hand velocity;
+        # it must fail because neither individual hand is moving with the box.
+        env.rigid_body_states[:, 0, 7] = 1.0
+        env.rigid_body_states[:, 1, 7] = -1.0
+        env.box_lin_vel[:] = 0.0
+        env._update_box_carry_state()
+        self.assertFalse(bool(env.contact_proxy.item()))
+        self.assertFalse(bool(env.has_contacted.item()))
+
     def test_short_goal_pass_does_not_place(self):
         env = _make_env(motion_time=3.5)
         env.has_lifted[:] = True

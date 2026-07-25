@@ -10,6 +10,8 @@ from pathlib import Path
 import isaacgym  # Must be imported before torch.
 import hydra
 import torch
+from isaacgym import gymapi, gymutil
+from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf, open_dict
 
@@ -19,6 +21,71 @@ from legged_gym.utils import AttrDict, task_registry
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[5]
 _STANDARD_REFERENCE_ROOT = _PROJECT_ROOT / "outputs" / "adamimic_full_reference" / "standard"
+
+
+def _draw_box_contact_debug(env) -> None:
+    """Draw hand origins, configured contact points and closest box-side points."""
+    if not getattr(env, "box_carry_enabled", False):
+        return
+    env.gym.clear_lines(env.viewer)
+    hand_states = env.rigid_body_states[0:1, env.box_hand_indices, :]
+    hand_origins = hand_states[0, :, :3]
+    contact_points = env._box_hand_contact_points(hand_states)[0]
+    rel = contact_points - env.box_pos[0][None, :]
+    local = quat_rotate_inverse(
+        env.box_quat[0][None, :].expand(2, -1),
+        rel,
+    )
+    task = env.cfg.box_carry_task
+    patch_margin = float(getattr(task, "contact_patch_margin", 0.04))
+    patch_half_x = torch.clamp(env.box_half_extent[0] - patch_margin, min=1e-4)
+    patch_half_z = torch.clamp(env.box_half_extent[2] - patch_margin, min=1e-4)
+    closest_local = local.clone()
+    closest_local[:, 0] = closest_local[:, 0].clamp(-patch_half_x, patch_half_x)
+    closest_local[:, 1] = env.box_hand_side_signs * env.box_half_extent[1]
+    closest_local[:, 2] = closest_local[:, 2].clamp(-patch_half_z, patch_half_z)
+    closest_world = env.box_pos[0][None, :] + quat_rotate(
+        env.box_quat[0][None, :].expand(2, -1),
+        closest_local,
+    )
+    geoms = {
+        "left_origin": gymutil.WireframeSphereGeometry(0.018, 8, 8, None, color=(0.1, 0.35, 1.0)),
+        "right_origin": gymutil.WireframeSphereGeometry(0.018, 8, 8, None, color=(1.0, 0.45, 0.05)),
+        "left_contact": gymutil.WireframeSphereGeometry(0.024, 8, 8, None, color=(0.0, 0.9, 1.0)),
+        "right_contact": gymutil.WireframeSphereGeometry(0.024, 8, 8, None, color=(1.0, 0.85, 0.0)),
+        "surface": gymutil.WireframeSphereGeometry(0.020, 8, 8, None, color=(0.05, 1.0, 0.15)),
+    }
+    points = [
+        (geoms["left_origin"], hand_origins[0]),
+        (geoms["right_origin"], hand_origins[1]),
+        (geoms["left_contact"], contact_points[0]),
+        (geoms["right_contact"], contact_points[1]),
+        (geoms["surface"], closest_world[0]),
+        (geoms["surface"], closest_world[1]),
+    ]
+    for geom, point in points:
+        p = point.detach().cpu().tolist()
+        gymutil.draw_lines(
+            geom,
+            env.gym,
+            env.viewer,
+            env.envs[0],
+            gymapi.Transform(p=gymapi.Vec3(float(p[0]), float(p[1]), float(p[2]))),
+        )
+    verts = []
+    colors = []
+    for hand_idx, color in enumerate(((0.0, 0.9, 1.0), (1.0, 0.85, 0.0))):
+        a = contact_points[hand_idx].detach().cpu().tolist()
+        b = closest_world[hand_idx].detach().cpu().tolist()
+        verts.extend([a, b])
+        colors.append(color)
+    env.gym.add_lines(
+        env.viewer,
+        env.envs[0],
+        2,
+        torch.tensor(verts, dtype=torch.float32).numpy(),
+        torch.tensor(colors, dtype=torch.float32).numpy(),
+    )
 
 
 def _upgrade_removed_legacy_omomo_dataset(cfg) -> None:
@@ -99,11 +166,19 @@ def main(cfg):
 
     previous_event = -2
     max_steps = int(getattr(cfg, "max_play_steps", env.max_episode_length))
+    draw_contact_debug = bool(getattr(cfg, "draw_box_contact_debug", False))
     print(f"Replaying {cfg.resume_path} for at most {max_steps} control steps.")
+    if draw_contact_debug:
+        print(
+            "Drawing box contact debug: blue/orange=left/right link origin, "
+            "cyan/yellow=configured contact point, green=closest configured box-side point."
+        )
     for step in range(max_steps):
         with torch.inference_mode():
             actions = policy(obs)
             obs, _, _, _, dones, infos, _, _ = env.step(actions)
+        if draw_contact_debug:
+            _draw_box_contact_debug(env)
         event_id = int(env.motion_event_id[0].item())
         if step % 10 == 0 and getattr(env, "box_enabled", False):
             box_pos = env.box_rigid_body_states[0, :3]
