@@ -149,6 +149,13 @@ class LeggedRobot(BaseTask):
         self.reference_mode_type = str(getattr(getattr(self.cfg, "reference_mode", {}), "type", "sparse_gmr_human_dense"))
         self.phase_control_mode = str(getattr(getattr(self.cfg, "phase_control", {}), "mode", "learned"))
         self.fixed_dt_scale = float(getattr(getattr(self.cfg, "phase_control", {}), "fixed_dt_scale", 1.0))
+        box_carry_task_cfg = getattr(self.cfg, "box_carry_task", None)
+        if bool(getattr(box_carry_task_cfg, "enabled", False)) and bool(getattr(self.cfg.algorithm, "rsi", False)):
+            print(
+                "[BoxCarryRSI] Forcing algorithm.rsi=false for Box-Carry stage-1. "
+                "Phase-consistent RSI is future work."
+            )
+            self.cfg.algorithm.rsi = False
         self._validate_reference_mode_config()
         self._init_buffers()
         self._prepare_reward_function()
@@ -473,7 +480,8 @@ class LeggedRobot(BaseTask):
             else:
                 self.onging_offset_stage |= (self.motion_time >= keyframe_prev_time[i]) & (self.motion_time < keyframe_time[i])
 
-        self.update_motion_offset()
+        if not self.box_carry_enabled:
+            self.update_motion_offset()
 
         if self.cfg.dataset.real:
             self.is_stage_transition = torch.logical_or(self.is_stage_transition, self.warmup)
@@ -657,26 +665,56 @@ class LeggedRobot(BaseTask):
         self.reset_buf[:] = self.time_out_buf #| self.tracking_fail_buf
         self.reset_buf[:] |= self.keyframe_reset_buf
 
+        self.termination_timeout_buf = self.time_out_buf.clone()
+        self.termination_keyframe_deviation_buf = self.keyframe_reset_buf.bool().clone()
+        self.termination_root_rotation_buf = torch.zeros_like(self.time_out_buf)
+        self.termination_root_height_buf = torch.zeros_like(self.time_out_buf)
+        self.termination_dof_deviation_buf = torch.zeros_like(self.time_out_buf)
+        self.termination_box_too_far_buf = torch.zeros_like(self.time_out_buf)
+        self.termination_box_dropped_buf = torch.zeros_like(self.time_out_buf)
+
         if self.cfg.termination.rot_termination:
-            self.reset_buf |= torch.any(torch.abs(self.projected_gravity[:, 0:1]) > 0.8, dim=1)
-            self.reset_buf |= torch.any(torch.abs(self.projected_gravity[:, 1:2]) > 0.8, dim=1)
+            self.termination_root_rotation_buf = (
+                torch.any(torch.abs(self.projected_gravity[:, 0:1]) > 0.8, dim=1)
+                | torch.any(torch.abs(self.projected_gravity[:, 1:2]) > 0.8, dim=1)
+            )
+            self.reset_buf |= self.termination_root_rotation_buf
         if self.cfg.termination.height_termination:
-            self.reset_buf |= self.root_states[:, 2] < 0.4
+            self.termination_root_height_buf = self.root_states[:, 2] < 0.4
+            self.reset_buf |= self.termination_root_height_buf
             # self.reset_buf |= torch.min(self.body_pos[:, self.feet_keyframe_indices, 2], 1)[0] < -0.00
         # self.reset_buf[:] = False
         # print(self.motion_time)
         if self.cfg.termination.dof_termination:
-            dof_error = (self.motion_dof_pos - self.dof_pos).max(dim=-1)[0] > (self.cfg.termination_curriculum.terminate_when_motion_far_threshold_max / 2)
-            self.reset_buf |= dof_error
+            self.termination_dof_deviation_buf = (
+                (self.motion_dof_pos - self.dof_pos).max(dim=-1)[0]
+                > (self.cfg.termination_curriculum.terminate_when_motion_far_threshold_max / 2)
+            )
+            self.reset_buf |= self.termination_dof_deviation_buf
 
         if self.box_carry_enabled:
-            too_far = torch.linalg.vector_norm(
+            self.termination_box_too_far_buf = torch.linalg.vector_norm(
                 self.box_pos[:, :2] - self.root_states[:, :2], dim=1
             ) > float(self.cfg.box_carry_task.max_box_robot_distance)
-            self.reset_buf |= too_far | self.box_dropped
+            self.termination_box_dropped_buf = self.box_dropped.clone()
+            self.reset_buf |= self.termination_box_too_far_buf | self.termination_box_dropped_buf
 
         # print(self.motion_time)
         # self.reset_buf[:] = self.motions.check_timeout(self.motion_ids[:], self.motion_time[:])
+
+    def _log_termination_reason_ratios(self, env_ids):
+        """Log non-exclusive reset reasons for the just-finished episodes."""
+        reason_buffers = {
+            "timeout": self.termination_timeout_buf,
+            "keyframe_deviation": self.termination_keyframe_deviation_buf,
+            "root_rotation": self.termination_root_rotation_buf,
+            "root_height": self.termination_root_height_buf,
+            "dof_deviation": self.termination_dof_deviation_buf,
+            "box_too_far": self.termination_box_too_far_buf,
+            "box_dropped": self.termination_box_dropped_buf,
+        }
+        for reason, mask in reason_buffers.items():
+            self.extras["episode"][f"termination_{reason}_ratio"] = mask[env_ids].float().mean()
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -702,6 +740,12 @@ class LeggedRobot(BaseTask):
         self.extras["time_outs"] = self.time_out_buf
         self.extras['success'] = ~self.episode_failed_buf
         self.extras["completions"] = self.episode_length_buf * self.dt / motion_time
+        actual_episode_duration = torch.clamp(
+            self.last_episode_length_buf[env_ids].float() * self.dt, min=self.dt
+        )
+        self.extras["episode"]["actual_episode_length"] = self.last_episode_length_buf[env_ids].float().mean()
+        self.extras["episode"]["actual_episode_duration"] = actual_episode_duration.mean()
+        self._log_termination_reason_ratios(env_ids)
         if self.box_carry_enabled:
             self.extras["episode"].update(self._box_carry_metrics(env_ids))
 
@@ -758,7 +802,11 @@ class LeggedRobot(BaseTask):
             self.init_quat_noise[env_ids] = euler_to_quaternion(init_quat_noise)
 
         for key in self.episode_sums.keys():
-            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] / self.max_episode_length_s)
+            reward_fixed_horizon = self.episode_sums[key][env_ids] / self.max_episode_length_s
+            reward_per_actual_second = self.episode_sums[key][env_ids] / actual_episode_duration
+            self.extras["episode"]['rew_' + key] = torch.mean(reward_fixed_horizon)
+            self.extras["episode"]['rew_fixed_horizon_' + key] = torch.mean(reward_fixed_horizon)
+            self.extras["episode"]['rew_per_actual_second_' + key] = torch.mean(reward_per_actual_second)
             self.episode_sums[key][env_ids] = 0.
         # send timeout info to the algorithm
         self.extras['env']["time_outs"] = self.time_out_buf
@@ -938,7 +986,8 @@ class LeggedRobot(BaseTask):
             else:
                 self.onging_offset_stage |= (self.motion_time >= keyframe_prev_time[i]) & (self.motion_time < keyframe_time[i])
 
-        self.update_motion_offset(env_ids)
+        if not self.box_carry_enabled:
+            self.update_motion_offset(env_ids)
 
     def compute_reward(self):
         """ Compute rewards
@@ -1962,6 +2011,13 @@ class LeggedRobot(BaseTask):
         self.cur_keyframe_stage = torch.zeros(self.num_envs,dtype=torch.long, device=self.device) - 1
         self.keyframe_reset_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.episode_failed_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.termination_timeout_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_keyframe_deviation_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_root_rotation_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_root_height_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_dof_deviation_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_box_too_far_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.termination_box_dropped_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self.rew_buf = torch.zeros(self.num_envs, self.cfg.rewards.num_reward_groups, device=self.device, dtype=torch.float)
         self.rew_buf_high = torch.zeros(self.num_envs, self.cfg.rewards.num_reward_groups, device=self.device, dtype=torch.float)
@@ -2930,6 +2986,13 @@ class LeggedRobot(BaseTask):
             return
         if not self.box_enabled:
             raise RuntimeError("box_carry_task enabled but no box actor was created")
+        if bool(getattr(self.cfg.algorithm, "rsi", False)):
+            raise RuntimeError(
+                "box_carry_task does not support AdaMimic RSI in this first-stage prototype: "
+                "resetting the robot into contact/lift/carry phases while resetting the box "
+                "to the initial ground pose makes robot motion and object/task state inconsistent. "
+                "Set algorithm.rsi=false. Phase-consistent RSI is future work."
+            )
         task = self.cfg.box_carry_task
         roles = self.cfg.semantic_keyframes
         if roles is None:
@@ -2959,10 +3022,19 @@ class LeggedRobot(BaseTask):
             [self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name) for name in hand_names],
             dtype=torch.long, device=self.device,
         )
-        contact_offset = getattr(task, "hand_contact_offset", [0.055, 0.0, 0.0])
-        if len(contact_offset) != 3:
-            raise ValueError(f"box_carry_task.hand_contact_offset must be [x, y, z], got {contact_offset}")
-        self.box_hand_contact_offset = torch.tensor(contact_offset, dtype=torch.float, device=self.device)
+        default_contact_offset = getattr(task, "hand_contact_offset", [0.055, 0.0, 0.0])
+        left_contact_offset = getattr(task, "left_hand_contact_offset", default_contact_offset)
+        right_contact_offset = getattr(task, "right_hand_contact_offset", default_contact_offset)
+        for field, value in (
+            ("left_hand_contact_offset", left_contact_offset),
+            ("right_hand_contact_offset", right_contact_offset),
+        ):
+            if len(value) != 3:
+                raise ValueError(f"box_carry_task.{field} must be [x, y, z], got {value}")
+        self.box_hand_contact_offsets = torch.tensor(
+            [left_contact_offset, right_contact_offset],
+            dtype=torch.float, device=self.device,
+        )
         self.box_hand_side_signs = torch.tensor([1.0, -1.0], dtype=torch.float, device=self.device)
         n = self.num_envs
         self.command_box_distance = torch.zeros(n, device=self.device)
@@ -3075,10 +3147,17 @@ class LeggedRobot(BaseTask):
             rel_pos, rel_vel, height[:, None],
         ), dim=1)
 
+    def _box_phase_mask(self, start_role, end_role):
+        if not self.box_carry_enabled:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        start = float(self.semantic_role_times[start_role])
+        end = float(self.semantic_role_times[end_role])
+        return (self.motion_time >= start) & (self.motion_time < end)
+
     def _box_hand_contact_points(self, hand_states):
         hand_pos = hand_states[:, :, :3]
         hand_quat = hand_states[:, :, 3:7]
-        offsets = self.box_hand_contact_offset.view(1, 1, 3).expand(self.num_envs, 2, 3)
+        offsets = self.box_hand_contact_offsets.view(1, 2, 3).expand(self.num_envs, 2, 3)
         return hand_pos + quat_rotate(
             hand_quat.reshape(-1, 4),
             offsets.reshape(-1, 3),
@@ -3096,28 +3175,21 @@ class LeggedRobot(BaseTask):
             rel.reshape(-1, 3),
         ).reshape(self.num_envs, 2, 3)
         task = self.cfg.box_carry_task
-        # Approach should guide hands toward any feasible side surface first.
-        # Hard-coding left->+Y and right->-Y too early made the auxiliary task
-        # fight full-reference imitation when the retargeted wrist convention
-        # landed on the opposite side.  Contact can still optionally require
-        # the two hands to end up on opposite sides.
-        candidate_signs = torch.tensor([1.0, -1.0], dtype=torch.float, device=self.device)
-        side_gap_candidates = local[:, :, 1, None] * candidate_signs.view(1, 1, 2) - self.box_half_extent[1]
+        side_gap = self.box_hand_side_signs.view(1, 2) * local[:, :, 1] - self.box_half_extent[1]
         target_clearance = float(getattr(task, "contact_surface_margin", 0.035))
         min_clearance = float(getattr(task, "min_surface_clearance", 0.015))
         patch_margin = float(getattr(task, "contact_patch_margin", 0.04))
         patch_half_x = torch.clamp(self.box_half_extent[0] - patch_margin, min=1e-4)
         patch_half_z = torch.clamp(self.box_half_extent[2] - patch_margin, min=1e-4)
-        clearance_error = torch.abs(side_gap_candidates - target_clearance)
+        clearance_error = torch.abs(side_gap - target_clearance)
         patch_x_error = (torch.abs(local[:, :, 0]) - patch_half_x).clamp(min=0.0)
         patch_z_error = (torch.abs(local[:, :, 2]) - patch_half_z).clamp(min=0.0)
-        surface_distance_candidates = torch.sqrt(
+        surface_distance = torch.sqrt(
             clearance_error.square()
-            + patch_x_error[:, :, None].square()
-            + patch_z_error[:, :, None].square()
+            + patch_x_error.square()
+            + patch_z_error.square()
         )
-        surface_distance, side_index = torch.min(surface_distance_candidates, dim=-1)
-        selected_side = candidate_signs[side_index]
+        selected_side = torch.where(local[:, :, 1] >= 0.0, 1.0, -1.0)
         inside_aabb = torch.all(torch.abs(local) < self.box_half_extent.view(1, 1, 3), dim=-1)
         aabb_exit_depth = torch.min(self.box_half_extent.view(1, 1, 3) - torch.abs(local), dim=-1).values
         aabb_penetration = torch.where(
@@ -3125,8 +3197,7 @@ class LeggedRobot(BaseTask):
             aabb_exit_depth.clamp(min=0.0),
             torch.zeros_like(aabb_exit_depth),
         )
-        nearest_side_gap = torch.max(side_gap_candidates, dim=-1).values
-        clearance_violation = (min_clearance - nearest_side_gap).clamp(min=0.0)
+        clearance_violation = (min_clearance - side_gap).clamp(min=0.0)
         penetration = torch.maximum(aabb_penetration, clearance_violation)
         return surface_distance, penetration, selected_side
 
@@ -3215,41 +3286,34 @@ class LeggedRobot(BaseTask):
             return torch.zeros(self.num_envs, device=self.device)
         distance = 0.5 * (self.left_hand_box_distance + self.right_hand_box_distance)
         reward = torch.exp(-distance / float(self.cfg.box_carry_task.approach_sigma))
-        return reward * (~self.has_contacted).float()
+        return reward * self._box_phase_mask("approach", "contact").float()
 
     def _reward_box_hand_penetration(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
-        task = self.cfg.box_carry_task
-        distance = torch.stack((self.left_hand_box_distance, self.right_hand_box_distance), dim=1)
-        penetration = torch.stack((self.left_hand_box_penetration, self.right_hand_box_penetration), dim=1)
-        # Penalize actual near-contact interpenetration, not arbitrary retarget
-        # mismatch while the untrained policy is far from the object.  The
-        # previous always-on barrier was large enough to make the policy give
-        # up imitation before contact/lift rewards ever became reachable.
-        active_distance = float(getattr(task, "penetration_active_distance", 0.18))
-        max_penalty = float(getattr(task, "max_penetration_penalty", 0.05))
-        active = distance <= active_distance
-        return torch.where(active, penetration.clamp(max=max_penalty), torch.zeros_like(penetration)).mean(dim=1)
+        reward = 0.5 * (self.left_hand_box_penetration + self.right_hand_box_penetration)
+        return reward * self._box_phase_mask("approach", "lift").float()
 
     def _reward_box_contact_proxy(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
-        return self.contact_proxy.float()
+        return self.contact_proxy.float() * self._box_phase_mask("approach", "lift").float()
 
     def _reward_box_lift(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
         height = self.box_pos[:, 2] - self.box_ground_z - self.box_half_extent[2]
-        return self.has_contacted.float() * torch.clamp(
+        reward = self.has_contacted.float() * torch.clamp(
             height / float(self.cfg.box_carry_task.lift_threshold), 0.0, 1.0
         ) * self.contact_proxy.float()
+        return reward * self._box_phase_mask("contact", "lift").float()
 
     def _reward_box_transport(self):
         if not self.box_carry_enabled:
             return torch.zeros(self.num_envs, device=self.device)
         bound = float(self.cfg.box_carry_task.max_progress_per_step)
-        return self.has_lifted.float() * self.box_goal_progress.clamp(-bound, bound)
+        reward = self.has_lifted.float() * self.box_goal_progress.clamp(-bound, bound)
+        return reward * self._box_phase_mask("lift", "arrive").float()
 
     def _reward_box_place(self):
         if not self.box_carry_enabled:
@@ -3260,7 +3324,7 @@ class LeggedRobot(BaseTask):
         reward = torch.exp(-goal_distance / float(self.cfg.box_carry_task.place_position_sigma))
         reward *= torch.exp(-torch.abs(height) / float(self.cfg.box_carry_task.place_height_sigma))
         reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
-        return self.has_lifted.float() * reward
+        return self.has_lifted.float() * reward * self._box_phase_mask("arrive", "place").float()
 
     def _reward_box_release(self):
         if not self.box_carry_enabled:
@@ -3269,7 +3333,7 @@ class LeggedRobot(BaseTask):
         speed = torch.linalg.vector_norm(self.box_lin_vel, dim=1)
         reward = torch.clamp(separated / float(self.cfg.box_carry_task.release_distance_threshold), 0.0, 1.0)
         reward *= torch.exp(-speed / float(self.cfg.box_carry_task.place_velocity_sigma))
-        return self.has_placed.float() * reward
+        return self.has_placed.float() * reward * self._box_phase_mask("place", "release").float()
 
 
     #------------ reward functions----------------

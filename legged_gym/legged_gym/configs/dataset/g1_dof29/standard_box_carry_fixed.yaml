@@ -9,6 +9,9 @@ reference_mode:
 phase_control:
   mode: fixed_reference
   fixed_dt_scale: 1.0
+algorithm:
+  algorithm:
+    rsi: false
 dataset:
   folder: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard
   joint_mapping: /home/aozhou/shixiongbo/GMR/outputs/adamimic_full_reference/standard/joint_id.txt
@@ -48,15 +51,14 @@ box_carry_task:
   command_normalization: 1.0
   left_hand_body_name: left_rubber_hand
   right_hand_body_name: right_rubber_hand
-  hand_contact_offset: [0.055, 0.0, 0.0]
+  left_hand_contact_offset: [0.055, 0.0, 0.0]
+  right_hand_contact_offset: [0.055, 0.0, 0.0]
   contact_surface_margin: 0.035
   min_surface_clearance: 0.015
   contact_patch_margin: 0.04
-  contact_distance_threshold: 0.14
-  contact_penetration_tolerance: 0.04
-  penetration_active_distance: 0.18
-  max_penetration_penalty: 0.05
-  require_opposite_contact_sides: false
+  contact_distance_threshold: 0.10
+  contact_penetration_tolerance: 0.02
+  require_opposite_contact_sides: true
   contact_velocity_tolerance: 0.75
   contact_hold_steps: 3
   lift_threshold: 0.08
@@ -74,7 +76,7 @@ box_carry_task:
   drop_hold_steps: 15
   max_box_robot_distance: 3.0
   max_progress_per_step: 0.05
-  approach_sigma: 0.35
+  approach_sigma: 0.15
   place_position_sigma: 0.12
   place_height_sigma: 0.04
   place_velocity_sigma: 0.35
@@ -85,9 +87,9 @@ box_carry_observation:
   num_privileged_obs_high: 145
 rewards:
   scales:
-    dense_box_hand_approach: 1.0
-    dense_box_hand_penetration: -0.5
-    dense_box_contact_proxy: 0.5
+    dense_box_hand_approach: 0.5
+    dense_box_hand_penetration: -3.0
+    dense_box_contact_proxy: 1.0
     dense_box_lift: 2.0
     dense_box_transport: 5.0
     dense_box_place: 2.0

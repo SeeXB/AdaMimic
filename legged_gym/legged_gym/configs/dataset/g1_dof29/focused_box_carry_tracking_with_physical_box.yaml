@@ -1,0 +1,15 @@
+defaults:
+  - /dataset/g1_dof29/focused_box_carry_fixed@_here_
+  - _self_
+
+task_id: focused_box_carry_tracking_with_physical_box
+
+rewards:
+  scales:
+    dense_box_hand_approach: 0.0
+    dense_box_hand_penetration: 0.0
+    dense_box_contact_proxy: 0.0
+    dense_box_lift: 0.0
+    dense_box_transport: 0.0
+    dense_box_place: 0.0
+    dense_box_release: 0.0
